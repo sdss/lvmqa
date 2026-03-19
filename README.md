@@ -6,10 +6,12 @@ Quality assurance tools for LVM.
 
 ## List of scripts
 
-| Script          | Description                       | Input   | Output         |
-| --------------- | --------------------------------- | ------- | -------------- |
-| `photometry.py` | for point 2 and 3 from the DRP QA | SFrames | photometry.csv |
-|                 |                                   |         |                |
+Each script produces a table of results with an `expnum` column, which can be used to join the outputs.
+
+| Script              | Description                       | Input   | Output             |
+| ------------------- | --------------------------------- | ------- | ------------------ |
+| `photometry.py`     | for point 2 and 3 from the DRP QA | SFrames | photometry.csv     |
+| `weakest_elines.py` | for point 6 form DRP QA           | DAP     | weakest_elines.csv |
 
 
 
