@@ -317,6 +317,7 @@ def mjd_stability(filename,outroot='drpall',nexp=5):
         return
 
 
+    xtab=xtab[xtab['exptime']>=899]
     mjd,counts=np.unique(xtab['mjd'],return_counts=True)
     plt.close(1)
     plt.figure(1,(12,6))
@@ -383,6 +384,7 @@ def mjd_stability_ratio(filename,outroot='drpall',nexp=5):
         print('Could not read: ',filename)
         return
 
+    xtab=xtab[xtab['exptime']>=899]
     mjd,counts=np.unique(xtab['mjd'],return_counts=True)
 
     plt.close(1)
@@ -433,8 +435,9 @@ def steer(argv):
 
     Reads a drpall FITS table and produces the full set of summary plots
     and statistics by calling :func:`drp_stats`, :func:`calibration_used`,
-    :func:`compare_sensitivity_methods`, :func:`compare_sensitivity_ratio`,
-    :func:`mjd_stability`, and :func:`mjd_stability_ratio`.
+    :func:`plot_sensitivities`, :func:`compare_sensitivity_methods`,
+    :func:`compare_sensitivity_ratio`, :func:`mjd_stability`, and
+    :func:`mjd_stability_ratio`.
 
     All figures are written to the ``Plot_drpall/`` directory, which is
     created if it does not already exist.
@@ -484,6 +487,7 @@ def steer(argv):
     os.makedirs('Plot_drpall',exist_ok=True)
     drp_stats(filename=drp_file)
     calibration_used(filename=drp_file,outroot=outroot)
+    plot_sensitivities(filename=drp_file,outroot=outroot)
     compare_sensitivity_methods(filename=drp_file,outroot=outroot)
     compare_sensitivity_ratio(filename=drp_file,outroot=outroot)
     mjd_stability(filename=drp_file,outroot=outroot)
