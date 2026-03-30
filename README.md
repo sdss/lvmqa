@@ -12,7 +12,8 @@ Each script produces a table of results with an `expnum` column, which can be us
 | ------------------- | --------------------------------- | ------- | ------------------ |
 | `photometry.py`     | for point 2 and 3 from the DRP QA | SFrames | photometry.csv     |
 | `weakest_elines.py` | for point 6 form DRP QA           | DAP     | weakest_elines.csv |
-! `drpall_compare.py` | stats and plots of drp_all file   | drpall  | drp summary plots  |
+| `drpall_compare.py` | stats and plots of drp_all file   | drpall  | drp summary plots  |
+| `get_DAP_files.py`  | downloads DAP frames              | DR20 list | dap_file_list.txt  |
 
 
 
