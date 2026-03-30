@@ -14,6 +14,9 @@ Each script produces a table of results with an `expnum` column, which can be us
 | `weakest_elines.py` | for point 6 form DRP QA           | DAP     | weakest_elines.csv |
 | `drpall_compare.py` | stats and plots of drp_all file   | drpall  | drp summary plots  |
 | `get_DAP_files.py`  | downloads DAP frames              | DR20 list | dap_file_list.txt  |
+| `DR20_DAP_flux_comp.py` | for point 7 of DAP QA         | dap_file_list | fits tables and plots  |
+| `DAPflux_comp_tools.py` | functions used in `DR20_DAP_flux_comp.py` |  |  |
+| `DR20_DAP_flux_comp_plots.py` | generate plots from tables saved in `DR20_DAP_flux_comp.py` | fits tables | various plots |
 
 
 
