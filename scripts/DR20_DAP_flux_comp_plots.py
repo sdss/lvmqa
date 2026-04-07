@@ -20,6 +20,7 @@ Description: reads in tables saved in DR20_DAP_flux_comp.py to generate overall 
         'DR20_flux_comparison_by_line.png': overplot np/pek distribution for each line for every tile plus full data set median and standard deviation 
 """
 ##import necessary libraries
+import os
 from astropy.table import Table
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
@@ -75,6 +76,9 @@ def plot_by_line_strength(table_file):
     max_points=np.full(len(bin_centers), np.nan)
     for i in range(len(bin_centers)):
         max_points[i] = np.nanmax(line_strength_array[:, 0, i])
+    #replace np.nan with 0 in number of points per bin to avoid issues with scaling alpha of ellipses
+    bad_inds=np.where(np.isnan(line_strength_array[:,0,:]))
+    line_strength_array[bad_inds[0],0,bad_inds[1]]=0
 
     '''
     #now using ellipse to show distribution within bins more clearly
@@ -114,6 +118,9 @@ def plot_by_EW(table_file):
     max_points=np.full(len(bin_centers), np.nan)
     for i in range(len(bin_centers)):
         max_points[i] = np.nanmax(ew_array[:, 0, i])
+    #replace np.nan with 0 in number of points per bin to avoid issues with scaling alpha of ellipses
+    bad_inds=np.where(np.isnan(ew_array[:,0,:]))
+    ew_array[bad_inds[0],0,bad_inds[1]]=0
 
     '''
     #now using ellipse to show distribution within bins more clearly
@@ -157,6 +164,11 @@ def plot_by_snr(table_file):
     for i in range(len(bin_centers)):
         max_points_p[i] = np.nanmax(snr_array[:, 0, i])
         max_points_np[i] = np.nanmax(snr_array[:, 3, i])
+    #replace np.nan with 0 in number of points per bin to avoid issues with scaling alpha of ellipses
+    bad_inds=np.where(np.isnan(snr_array[:,0,:]))
+    snr_array[bad_inds[0],0,bad_inds[1]]=0
+    bad_inds2=np.where(np.isnan(snr_array[:,3,:]))
+    snr_array[bad_inds2[0],3,bad_inds2[1]]=0
 
     fig, ax =plt.subplots(nrows=2, ncols=1,figsize=(12, 12))
     #plt.subplot(2,1,1)
@@ -210,17 +222,21 @@ def plot_by_line_name(line_list_file, file_list_file):
     IQR_all = np.full((len(file_list), len(tab_elines)), np.nan)
     n_points_all = np.full((len(file_list), len(tab_elines)), np.nan)
     for i in range(len(file_list)):
-        ratio_tab = Table.read(file_list[i].replace('/lvm', 'sdsswork/lvm').replace('.dap.fits', '_flux_comparison_stats.fits'), format='fits')
-        quartile1, medians_all[i,:], quartile3, n_points_all[i,:] = ratio_tab['quartile1'], ratio_tab['median'], ratio_tab['quartile3'], ratio_tab['n_good']
-        centers_all[i,:]=(quartile1+quartile3) / 2
-        IQR_all[i,:] = quartile3 - quartile1
+        file=file_list[i].replace('/lvm', 'sdsswork/lvm').replace('.dap.fits', '_flux_comparison_stats.fits')
+        if os.path.exists(file):
+            ratio_tab = Table.read(file_list[i].replace('/lvm', 'sdsswork/lvm').replace('.dap.fits', '_flux_comparison_stats.fits'), format='fits')
+            quartile1, medians_all[i,:], quartile3, n_points_all[i,:] = ratio_tab['quartile1'], ratio_tab['median'], ratio_tab['quartile3'], ratio_tab['n_good']
+            centers_all[i,:]=(quartile1+quartile3) / 2
+            IQR_all[i,:] = quartile3 - quartile1
     max_points = np.nanmax(n_points_all, axis=0) #currently all are 1754 (fit either fails for all or none of a line which seems unrealistic)
     #generate plot
     fig, ax=plt.subplots(figsize=(12, 6))
     for i in range(len(file_list)):
-        for j in range(len(tab_elines)):
-            patch = Ellipse((inds[j], centers_all[i,j]), width=0.7, height=IQR_all[i,j], facecolor='skyblue', alpha=0.2, label='IQR')#n_points_all[i,j]/max_points[j])
-            ax.add_artist(patch)
+        file=file_list[i].replace('/lvm', 'sdsswork/lvm').replace('.dap.fits', '_flux_comparison_stats.fits')
+        if os.path.exists(file):
+            for j in range(len(tab_elines)):
+                patch = Ellipse((inds[j], centers_all[i,j]), width=0.7, height=IQR_all[i,j], facecolor='skyblue', alpha=0.2, label='IQR')#n_points_all[i,j]/max_points[j])
+                ax.add_artist(patch)
         plt.scatter(inds, medians_all[i,:], marker='.', color='deepskyblue', label='frame median')
     plt.hlines(1, inds[0]-1, inds[-1]+1, color='grey', linestyle='--', alpha=0.5, zorder=0) #add horizontal line at ratio=1 for reference
     plt.errorbar(inds, np.nanmedian(medians_all, axis=0), yerr=np.nanstd(medians_all, axis=0), fmt='ok', capsize=2, label='median distribution') #add error bars showing 1sigma range of medians for all lines
@@ -238,10 +254,10 @@ def plot_by_line_name(line_list_file, file_list_file):
 if __name__ == '__main__':
     # Example usage: update file list / line list as needed
     # Uncomment and adjust these for your workflow
-    #plot_by_frame('dr20_pointings_final_v1.2.0.csv', 'DR20_pe_np_comparison_stats.fits')
-    #plot_by_line_strength('DR20_pe_np_comparison_by_line_strength.fits')
-    #plot_by_EW('DR20_pe_np_comparison_by_EW.fits')
+    plot_by_frame('dr20_pointings_final_v1.2.0.csv', 'DR20_pe_np_comparison_stats.fits')
+    plot_by_line_strength('DR20_pe_np_comparison_by_line_strength.fits')
+    plot_by_EW('DR20_pe_np_comparison_by_EW.fits')
     plot_by_snr('DR20_pe_np_comparison_by_snr.fits')
-    #plot_by_line_name('../lvmdap/_legacy/emission_lines_strong.LVM', 'dap_file_list.txt')
+    plot_by_line_name('../lvmdap/_legacy/emission_lines_strong.LVM', 'dap_file_list.txt')
 
 ##bin plots show standard deviation, but print IQR which is much smaller and less sensitive to outliers; may want to plot this as well?
