@@ -33,7 +33,10 @@ def get_file_list(exposure_list):
     ##add cl_prefix to extragalactic targets that are run through secondary analysis
     for i in range(len(file_list)):
         if file_list['NGCname'][i] in extragalactic_targets:
-            dap_files[i] = dap_files[i].replace('dap-', 'cl_dap-')
+            if file_list['expnum'][i] in [14114,15660,20486,20573,20980,22929]: #list of exposures on outskirts of NGC4945 still using cl_ prefix
+                dap_files[i] = dap_files[i].replace('dap-', 'cl_dap-')
+            else:
+                dap_files[i] = dap_files[i].replace('dap-', 'LV_dap-')
 
     ##save file list to a text file
     with open('dap_file_list.txt', 'w') as f:

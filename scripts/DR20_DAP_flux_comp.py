@@ -124,11 +124,12 @@ snr_stat_table.write('DR20_pe_np_comparison_by_snr.fits', overwrite=True) #saved
 
 print('Data processing complete: saved DR20_pe_np_comparison_stats.fits, DR20_pe_np_comparison_by_line_strength.fits, DR20_pe_np_comparison_by_EW.fits, DR20_pe_np_comparison_by_snr.fits')
 
-# Overall diagnostic plotting is now handled by DR20_DAP_flux_comp_plots.py
-
 ##identify exposures that are outliers from median percent difference across all lines
 outlier_exposures = flux_stat_table[flux_stat_table['median_perc_diff'] > np.nanmedian(flux_stat_table['median_perc_diff']) + 1 * np.nanstd(flux_stat_table['median_perc_diff'])]
-print('Outlier exposures with median percent difference > 1 sigma from median (>8% difference):')
+print('Outlier exposures with median percent difference > 1 sigma from median (>20% difference):')
 print(outlier_exposures['expnum'].data)
-#outliers in outskirts of Orion and Rosette
-#[ 5676,  5677,  5748,  5750, 30171, 30173, 30179, 30180, 30197, 30198, 30199, 30200, 30758, 30759, 30813, 30814, 30868, 30870, 30924, 31087, 31090]
+#updated list [12183 14114 15660 20486 20573 20980 22929 30171 30813 30868 31087 31090] # NGC4945, outskirts of Rossette
+outlier_exposures2 = flux_stat_table[flux_stat_table['median_perc_diff'] > np.nanmedian(flux_stat_table['median_perc_diff']) + 10]
+print('Outlier exposures with median percent difference > 10% :')
+print(outlier_exposures2['expnum'].data)
+#[ 5511  5512 12183 14114 15660 20486 20573 20980 22929 30171 30173 30197 30198 30199 30758 30759 30813 30868 30870 31087 31090] #M33, NGC4945, outskirts of Rossette
