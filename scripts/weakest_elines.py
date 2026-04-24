@@ -2,15 +2,18 @@
 Find the weakest detected emission line in the DAP
 
 This script addresses point 6 of the LVM DRP QA. The result is 
-saved to three csv tables. The contain the following columns:
+saved a csv table with the following columns:
 
-* expnum : exposure number of the pointing.
-* Line : line that has at least min_detected fibers above threshold.
-* n_detected : number of fibers where this line is above the threshold.
-* snr : the largest flux/error of this line.
-* flux : the flux of the fiber with the heighest snr.
-* error : the error of the fiber with the heighest snr.
-* detected_lines : all other lines that have at least min_detected fibers above threshold.
+expnum           - exposure number of the pointing
+detected_lines   - all other lines with at least min_detected fibers above threshold
+
+The following columns are present for each filter (B, R, I):
+
+weakest_line_X   - line with at least min_detected fibers above threshold
+flux_X           - flux of the fiber with the highest SNR
+error_X          - error of the fiber with the highest SNR
+snr_X            - largest flux/error ratio for this line
+n_detected_X     - number of fibers above threshold
 """
 
 from astropy.io import fits
@@ -71,45 +74,48 @@ def find_weakest_eline(elines, threshold=3, min_detected=5):
     idx = line_properties[line_properties["n_detected"]>=min_detected]["max_snr"].idxmin()
     weakest_line = line_properties.loc[idx].to_list()
     # add list of lines that are detected
-    return weakest_line + [",".join(line_properties[line_properties["n_detected"]>min_detected]["line"])]
+    return weakest_line + [";".join(line_properties[line_properties["n_detected"]>min_detected]["line"])]
 
 if __name__ == "__main__":
-    # the catalogue with the tiles for DR20
-    dr20 = pd.read_csv(Path("dr20_pointings_final_v2.csv"))
-    # adjust the location. This is for the flatiron server
-    sdsswork_folder = Path("..","data","work")
-    # the folder structure for the dap files is different
-    dap_files = dr20.apply(lambda row: 
+    sdsswork_folder = Path("..","..","data","work")
+
+    dr20 = pd.read_csv(Path("dr20_pointings_final_v4.csv"))
+    dr20["dap_file"] = dr20.apply(lambda row: 
         sdsswork_folder / "lvm" / "spectro" / "analysis" / "1.2.0" /
-        f"{row['tilegrp']}" / 
-        f"{row['tileid']}" / 
-        f"{row['mjd']}" / 
-        f"{row['expnum']:08}" / 
+        f"{row['tilegrp']}" / f"{row['tileid']}" / f"{row['mjd']}" / f"{row['expnum']:08}" / 
         f"dap-rsp108-sn20-{row['expnum']:08}.dap.fits.gz",
         axis=1
         )
-
-    rowsB = []
-    rowsR = []
-    rowsI = []
-    for filename in tqdm(dap_files):
+    
+    rows = []
+    for filename in tqdm(dr20["dap_file"]):
         expnum = int(re.search(r"-(\d+)\.",filename.stem).group(1))
-        with fits.open(filename) as hdul:
-            NP_ELINES_B = Table(hdul["NP_ELINES_B"].data)
-            NP_ELINES_R = Table(hdul["NP_ELINES_R"].data)
-            NP_ELINES_I = Table(hdul["NP_ELINES_I"].data)
-        rowsB.append([expnum]+find_weakest_eline(NP_ELINES_B, threshold=3, min_detected=5))
-        rowsR.append([expnum]+find_weakest_eline(NP_ELINES_R, threshold=3, min_detected=5))
-        rowsI.append([expnum]+find_weakest_eline(NP_ELINES_I, threshold=3, min_detected=5))
-    
-    weakest_linesB = pd.DataFrame(rowsB,columns = ["expnum","Line","n_detected","snr","flux","error","detected_lines"])
-    weakest_linesR = pd.DataFrame(rowsR,columns = ["expnum","Line","n_detected","snr","flux","error","detected_lines"])
-    weakest_linesI = pd.DataFrame(rowsI,columns = ["expnum","Line","n_detected","snr","flux","error","detected_lines"])
-    
-    weakest_linesB.to_csv("elinesB.csv",index=False)
-    weakest_linesR.to_csv("elinesR.csv",index=False)
-    weakest_linesI.to_csv("elinesI.csv",index=False)
 
-    print(f'{len(weakest_linesB["detected_lines"].str.split(",").explode().unique())} unique lines in B')
-    print(f'{len(weakest_linesR["detected_lines"].str.split(",").explode().unique())} unique lines in R')
-    print(f'{len(weakest_linesI["detected_lines"].str.split(",").explode().unique())} unique lines in I')
+        if filename.is_file():
+            with fits.open(filename) as hdul:
+                NP_ELINES_B = Table(hdul["NP_ELINES_B"].data)
+                NP_ELINES_R = Table(hdul["NP_ELINES_R"].data)
+                NP_ELINES_I = Table(hdul["NP_ELINES_I"].data)
+        else:
+            print(f"missing file: {filename}")
+            continue
+
+        row = {"expnum" : expnum}
+        detected_lines = []
+        for table, channel in zip ([NP_ELINES_B,NP_ELINES_R,NP_ELINES_I],["B","R","I"]):
+            results = find_weakest_eline(table, threshold=3, min_detected=5)
+            row = row | {
+                f"weakest_line_{channel}" : results[0],
+                f"flux_{channel}" : results[3], 
+                f"error_{channel}" : results[4],     
+                f"snr_{channel}" : results[2],
+                f"n_detected_{channel}" : results[1]
+            }
+            detected_lines.append(results[5])
+        row = row | {"detected_lines": ";".join(detected_lines)}
+        rows.append(row)
+    
+    weakest_lines = pd.DataFrame(rows)
+    weakest_lines = weakest_lines.set_index("expnum")
+    weakest_lines.to_csv("weakest_elines.csv")
+    

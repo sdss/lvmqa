@@ -2,10 +2,16 @@
 Comparison with existing datasets for coloros and absolute photometry
 
 This script addresses point 2 and 3 of the LVM DRP QA. The reuslt is
-saved to a csv table with the expnum as the index.
+saved to a csv table. It contains the following columns:
+
+expnum                    - exposure number of the pointing.
+color_comparison_BR       - change in color B and R between SCI and MOD
+color_comparison_ZR       - change in color Z and R between SCI and MOD
+photometry_comparison_R   - change in color R between SCI and MOD
 """
 
 from astropy.io import fits 
+from astropy.table import Table 
 import matplotlib.pyplot as plt
 import numpy as np 
 import pandas as pd 
@@ -55,10 +61,10 @@ def get_sensitivity_from_header(drp_files):
         df = pd.DataFrame(rows)
     else:
         df = pd.DataFrame(columns=["expnum"]+columns)
+
     df = df.set_index("expnum")
     # invalid values in the header are -999.9
     df.replace(-999.9, np.nan, inplace=True)
-    
     return df
 
 
@@ -146,21 +152,25 @@ def plot_channels(df,expnum):
 
 
 if __name__ == "__main__":
-    # the catalogue with the tiles for DR20
-    dr20 = pd.read_csv(Path("dr20_pointings_final_v2.csv"))
-    # adjust the location. This is for the flatiron server
-    sdsswork_folder = Path("..","data","work")
-    # for the drp we just have to change the parent folder
-    drp_files = dr20["location"].apply(lambda p: sdsswork_folder / Path(p).relative_to(Path("sdsswork")))
+    sdsswork_folder = Path("..","..","data","work")
 
-    sensitivity = get_sensitivity_from_header(drp_files)
+    # the catalogue with the tiles for DR20
+    dr20 = pd.read_csv(Path("dr20_pointings_final_v4.csv"))
+    dr20["drp_file"] = dr20.apply(lambda row: 
+        sdsswork_folder / "lvm" / "spectro" / "redux" / "1.2.0" /
+        f"{row['tilegrp']}" / f"{row['tileid']}" / f"{row['mjd']}" /  
+        f"lvmSFrame-{row['expnum']:08}.fits",
+        axis=1
+        )
+
+    sensitivity = get_sensitivity_from_header(dr20["drp_file"])
     sensitivity["color_comparison_BR"] = color_comparison(sensitivity,channel1="B",channel2="R")
     sensitivity["color_comparison_ZR"] = color_comparison(sensitivity,channel1="Z",channel2="R")
     sensitivity["photometry_comparison_R"] = photometry_comparison(sensitivity,channel="R")
     
     print(f"{sensitivity.isna().any(axis=1).sum()} entries with invalid values")
-    print(f"SCIB/SCIR - MODB/MODR > 1σ: {np.sum(sensitivity['color_comparison_BR']>1)}")
-    print(f"SCIZ/SCIR - MODZ/MODR > 1σ: {np.sum(sensitivity['color_comparison_ZR']>1)}")
+    print(f"SCIB/SCIR - MODB/MODR > 3σ: {np.sum(sensitivity['color_comparison_BR']>3)}")
+    print(f"SCIZ/SCIR - MODZ/MODR > 3σ: {np.sum(sensitivity['color_comparison_ZR']>3)}")
     print(f"SCIR-MODR > 3σ: {np.sum(sensitivity['photometry_comparison_R']>3)}")
-    
-    sensitivity.to_csv("photometry.csv")
+
+    sensitivity[list(sensitivity.columns)[-3:] + list(sensitivity.columns)[:-3]].to_csv("photometry.csv")
