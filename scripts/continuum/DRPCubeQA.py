@@ -29,7 +29,13 @@ class DRPCubeQA(object):
         qa.close()
     """
 
-    def __init__(self, path, expnum=None, memmap=True, verbose=True, zero_frac_warn_threshold=0.05, arm_jump_threshold = 3.0, log_path='./logs'):
+    def __init__(self, path, expnum=None, memmap=True, verbose=True,
+                 zero_frac_warn_threshold=0.05,
+                 arm_jump_threshold_warn = 1.0,
+                 arm_jump_threshold_bad = 2.0,
+                 warn_frac_threshold = 0.05,
+                 bad_frac_threshold = 0.05,
+                 log_path='./logs'):
         """
         Open the FITS file and load all relevant HDUs into memory.
 
@@ -45,8 +51,14 @@ class DRPCubeQA(object):
             Print messages to stdout
         zero_frac_warn_threshold : float
             Threshold for zero/NaN fraction warnings
-        arm_jump_threshold : float
-            Threshold for continuum jump between arms warnings (abs(jump)/mad_std)
+        arm_jump_threshold_warn : float
+            Threshold for continuum jump between arms (abs(jump)/mad_std) for flagging as warning
+        arm_jump_threshold_bad : float
+            Threshold for continuum jump between arms (abs(jump)/mad_std) for flagging as bad
+        warn_frac_threshold : float
+            Threshold for fraction of fibers with warning to trigger exposure-level warning flag
+        bad_frac_threshold : float
+            Threshold for fraction of bad fibers to trigger exposure-level bad flag
         log_path : str
             Directory where log files are saved
         """
@@ -55,8 +67,11 @@ class DRPCubeQA(object):
         self.memmap = memmap
         self.verbose = verbose
         self.zero_frac_warn_threshold = zero_frac_warn_threshold
-        self.arm_jump_threshold = arm_jump_threshold
-
+        self.arm_jump_threshold_warn = arm_jump_threshold_warn
+        self.arm_jump_threshold_bad = arm_jump_threshold_bad
+        self.warn_frac_threshold = warn_frac_threshold
+        self.bad_frac_threshold = bad_frac_threshold
+        
         self.log_dir = Path(log_path)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
@@ -725,12 +740,30 @@ class DRPCubeQA(object):
         diff_flux = (blue_resid - red_resid) / denom_safe
 
         # compute flag mask: |diff| > self.arm_jump_threshold
-        flagged_mask = np.isfinite(diff_flux) & (np.abs(diff_flux) > float(self.arm_jump_threshold))
-        flagged_science_indices = list(map(int, np.where(flagged_mask)[0]))   # indices into science_inds
-        flagged_global_indices = [int(science_inds[i]) for i in flagged_science_indices]  # actual fiber indices
-        n_flagged = len(flagged_science_indices)
-        flagged_frac = float(n_flagged) / float(max(1, n_science))
+        flagged_mask_warn = np.isfinite(diff_flux) & (np.abs(diff_flux) > float(self.arm_jump_threshold_warn))
+        flagged_science_indices_warn = list(map(int, np.where(flagged_mask_warn)[0]))   # indices into science_inds
+        flagged_global_indices_warn = [int(science_inds[i]) for i in flagged_science_indices_warn]  # actual fiber indices
+        n_flagged_warn = len(flagged_science_indices_warn)
+        flagged_frac_warn = float(n_flagged_warn) / float(max(1, n_science))
+        
+        flagged_mask_bad = np.isfinite(diff_flux) & (np.abs(diff_flux) > float(self.arm_jump_threshold_bad))
+        flagged_science_indices_bad = list(map(int, np.where(flagged_mask_bad)[0]))   # indices into science_inds
+        flagged_global_indices_bad = [int(science_inds[i]) for i in flagged_science_indices_bad]  # actual fiber indices
+        n_flagged_bad = len(flagged_science_indices_bad)
+        flagged_frac_bad = float(n_flagged_bad) / float(max(1, n_science))
 
+        warn_flag = None
+        if (flagged_frac_warn >= self.warn_frac_threshold) and (flagged_frac_bad < self.bad_frac_threshold):
+            warn_flag = 1
+        else:
+            warn_flag = 0
+
+        bad_flag = None
+        if (flagged_frac_bad >= self.bad_frac_threshold):
+            bad_flag = 1
+        else:
+            bad_flag = 0
+        
         findiff = diff_flux[np.isfinite(diff_flux)]
         median_diff = float(np.nanmedian(findiff)) if findiff.size > 0 else float("nan")
         max_diff = float(np.nanmax(findiff)) if findiff.size > 0 else float("nan")
@@ -812,7 +845,7 @@ class DRPCubeQA(object):
         #print('out_png = ', out_png)
         spec_plot_name = out_png.replace('.png','_spec.png')
         #print('spec_plot_name = ', spec_plot_name)
-        continuum_jump_plot_path = self._plot_flagged_spectra(flagged_global_indices=flagged_global_indices,
+        continuum_jump_plot_path = self._plot_flagged_spectra(flagged_global_indices=flagged_global_indices_warn,
                                                             wmin=blue_wmin-100.,
                                                             wmax=red_wmax+100.,
                                                             out_png=spec_plot_name)
@@ -820,15 +853,22 @@ class DRPCubeQA(object):
         summary = {
             "continuum_plot_path": out_png,
             "continuum_jump_plot_path": continuum_jump_plot_path,
-            "continuum_jump_threshold": float(self.arm_jump_threshold),
+            "continuum_jump_threshold_warn": float(self.arm_jump_threshold_warn),
+            "continuum_jump_threshold_bad": float(self.arm_jump_threshold_bad),
             "n_science": n_science,
-            "n_flagged": n_flagged,
-            "flagged_frac": flagged_frac,
-            "flagged_science_indices": flagged_science_indices,
-            "flagged_global_fiber_indices": flagged_global_indices,
+            "n_flagged_warn": n_flagged_warn,
+            "n_flagged_bad": n_flagged_bad,
+            "flagged_frac_warn": flagged_frac_warn,
+            "flagged_frac_bad": flagged_frac_bad,
+            "warn_frac_threshold": self.warn_frac_threshold,
+            "bad_frac_threshold": self.bad_frac_threshold,
+            "flagged_science_indices": flagged_science_indices_warn,
+            "flagged_global_fiber_indices": flagged_global_indices_warn,
             "median_arm_diff": median_diff,
             "min_arm_diff": min_diff,
             "max_arm_diff": max_diff,
+            "warning_flag": warn_flag,
+            "bad_flag": bad_flag,
             }
 
         arrays = {
@@ -843,9 +883,9 @@ class DRPCubeQA(object):
 
         if self.verbose:
             print("Continuum mismatch: %d/%d science fibers flagged (%.2f%%) with |blue-red|/MAD > %.2f" %
-                  (n_flagged, n_science, 100.*flagged_frac, self.arm_jump_threshold))
-            if n_flagged > 0:
-                print("Flagged global fiber indices (first 20):", flagged_global_indices[:20])
+                  (n_flagged_warn, n_science, 100.*flagged_frac_warn, self.arm_jump_threshold_warn))
+            if n_flagged_warn > 0:
+                print("Flagged global fiber indices (first 20):", flagged_global_indices_warn[:20])
 
         return (summary, arrays)
 
@@ -853,7 +893,7 @@ class DRPCubeQA(object):
     # -------------------------
     # Full report builder
     # -------------------------
-    def run_full_report(self, save_json=None):
+    def run_full_report(self, save_json=None, save_jump_list=False):
         """
         Run QA computations on the full arrays and return a report dict.
 
@@ -907,10 +947,17 @@ class DRPCubeQA(object):
             },
         }
 
+        def to_jsonable(x):
+            if isinstance(x, np.ndarray):
+                x = x.tolist()
+            return [None if (isinstance(v, float) and not np.isfinite(v)) else v for v in x]
+        
         # call continuum_mismatch_report
         plot_name = f"{save_json.replace('.json', '')}_continuum_check_blue.png"        
         cont_summary_blue, cont_arrays_blue = self.continuum_mismatch_report(os.path.join(self.log_dir,plot_name))
         report["extended_report"]["continuum_check_blue_red"] = cont_summary_blue
+        if save_jump_list == True:
+            report["extended_report"]["continuum_check_blue_red"]["jump_list"] = to_jsonable(list(cont_arrays_blue["diff_flux"]))
 
         plot_name = f"{save_json.replace('.json', '')}_continuum_check_ir.png"        
         cont_summary_ir, cont_arrays_ir = self.continuum_mismatch_report(os.path.join(self.log_dir,plot_name),
@@ -921,7 +968,15 @@ class DRPCubeQA(object):
                                                                    red_wmin=7650.0,
                                                                    red_wmax=7900.0,)
         report["extended_report"]["continuum_check_red_ir"] = cont_summary_ir
+
+        report["continuum_jump_warning_flag"] = max(report["extended_report"]["continuum_check_blue_red"]["warning_flag"],
+                                               report["extended_report"]["continuum_check_red_ir"]["warning_flag"])
+        report["continuum_jump_bad_flag"] = max(report["extended_report"]["continuum_check_blue_red"]["bad_flag"],
+                                               report["extended_report"]["continuum_check_red_ir"]["bad_flag"])
         
+        if save_jump_list == True:
+            report["extended_report"]["continuum_check_red_ir"]["jump_list"] = to_jsonable(list(cont_arrays_ir["diff_flux"]))
+
         if save_json:
             with open(os.path.join(self.log_dir,save_json), "w") as fh:
                 json.dump(report, fh, indent=2, sort_keys=True)
