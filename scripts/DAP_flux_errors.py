@@ -7,6 +7,7 @@ Description:
 This script compares reported flux errors from the DAP with residual spectra to evaluate the accuracy of the DAP flux error estimates. It calculates the ratio of the residual flux to the reported flux error for each spaxel and emission line, and analyzes the distribution of these ratios to identify any systematic trends or discrepancies in the DAP error estimates.
 '''
 ##import packages
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
@@ -16,14 +17,13 @@ from dap_tools import read_DAP_file
 c=2.99792e5 #[km/s]
 
 ##get DAP table and model files in the DR20 file list
-with open('dap_file_list_test.txt', 'r') as f:
+with open('dap_file_list.txt', 'r') as f:
     dap_files = f.read().splitlines()
-with open('dap_file_list_mod_test.txt', 'r') as f:
+with open('dap_file_list_mod.txt', 'r') as f:
     dap_mod_files = f.read().splitlines()
 
 dap_files = [entry.replace('/lvm', 'sdsswork/lvm') for entry in dap_files]
-dap_mod_files = [entry.replace('/lvm', 'sdsswork/lvm') for entry in dap_mod_files] #may need to run on Binder hub since these files take a lot of space
-#test with subset
+dap_mod_files = [entry.replace('/lvm', 'sdsswork/lvm') for entry in dap_mod_files] 
 
 ##table of emission lines to evaluate
 tab_elines = Table.read('QAemission_lines.LVM', format='ascii.no_header', names=('wl', 'line'))
@@ -52,28 +52,29 @@ def get_dap_line_fit(line, wl, dap_tab):
         ret_arr = np.full(len(id), np.nan)
         return ret_arr, ret_arr, ret_arr, ret_arr
     
-
 #generate table to store results
 flux_err_table = Table()
 #flux_err_table['expnum'] = dr20_file_list['expnum']
 for line, wl in zip(tab_elines['line'], tab_elines['wl']):
-    flux_err_table.add_columns([np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan)], names=[f'{line}_{wl}_flux', f'{line}_{wl}_flux_err', f'{line}_{wl}_width', f'{line}_{wl}_cen', f'{line}_{wl}_resid_rms'])
+    flux_err_table.add_columns([np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan), np.full(len(dap_files), np.nan)], names=[f'{line}_{wl}_flux', f'{line}_{wl}_flux_err', f'{line}_{wl}_width', f'{line}_{wl}_cen', f'{line}_{wl}_resid_rss'])
 flux_err_table.add_column(np.full(len(dap_files), np.nan), name='average_error_to_resid_ratio')
 
 all_fluxes = []
 all_snr = []
 all_ratios = []
 #get DAP fluxes and errors plus line widths
-for i in range(len(dap_files)):
-    dap_tab = read_DAP_file(dap_files[i]) #fit results
+#change to function and call in batches with download of model files before call and deleting them after
+def get_DAP_errors(index, dap_file, dap_mod_file):
+    i=index
+    dap_tab = read_DAP_file(dap_file) #fit results
     #residual from model
-    hdu=fits.open(dap_mod_files[i])
+    hdu=fits.open(dap_mod_file)
     model_spectra=hdu[0].data
-    residual = model_spectra[0,:,:] - model_spectra[1,:,:] #data - model to get residuals
+    residual = model_spectra[0,:,:] - model_spectra[8,:,:] #data - joint model to get residuals
     hdr=hdu[0].header
     wave = hdr['crval1']+hdr['cdelt1']*(np.arange(0,model_spectra.shape[2])-(hdr['crpix1']-1))
     file_errs=[]
-    file_rms=[]
+    file_rss=[]
     for j in range(len(tab_elines)):
         line = tab_elines['line'][j]
         wl = tab_elines['wl'][j]
@@ -84,19 +85,60 @@ for i in range(len(dap_files)):
         all_snr.append(flux/flux_err)
         #residuals
         wcen=((cen/c) * wl) + wl #convert to A
-        residual_rms=np.full(len(flux), np.nan)
+        sigma_hwhm = np.sqrt(2*np.log(2)) #conversion factor from sigma to HWHM for Gaussian line width
+        residual_rss=np.full(len(flux), np.nan)
         for k in range(len(flux)): #loop through each fiber
-            chan_start, chan_end = np.argmin(np.abs(wave-(wcen[k]-3*width[k]))), np.argmin(np.abs(wave-(wcen[k]+3*width[k])))
-            residual_rms[k] = np.sqrt(np.nanmean(residual[k, chan_start:chan_end]**2))
-        file_rms.append(residual_rms)
-        all_ratios.append((flux_err*1e-16)/residual_rms)
+            chan_start, chan_end = np.argmin(np.abs(wave-(wcen[k]-sigma_hwhm*width[k]))), np.argmin(np.abs(wave-(wcen[k]+sigma_hwhm*width[k])))
+            residual_rss[k] = np.sqrt(np.nansum(residual[k, chan_start:chan_end]**2))
+        file_rss.append(residual_rss)
+        all_ratios.append((flux_err*1e-16)/residual_rss)
         flux_err_table[f'{line}_{wl}_flux'][i] = np.nanmean(flux)
         flux_err_table[f'{line}_{wl}_flux_err'][i] = np.nanmean(flux_err)
         flux_err_table[f'{line}_{wl}_width'][i] = np.nanmean(width) #[A]
         flux_err_table[f'{line}_{wl}_cen'][i] = np.nanmean(cen) #[km/s]
-        flux_err_table[f'{line}_{wl}_resid_rms'][i] = np.nanmean(residual_rms)
+        flux_err_table[f'{line}_{wl}_resid_rss'][i] = np.nanmean(residual_rss)
     del hdu #save memory by deleting hdu after use
-    flux_err_table['average_error_to_resid_ratio'][i] = np.nanmean(np.array(file_errs)*1e-16/np.array(file_rms))
+    flux_err_table['average_error_to_resid_ratio'][i] = np.nanmean(np.array(file_errs)*1e-16/np.array(file_rss))
+
+nbatches=10
+nfiles_batch=round(len(dap_files)/nbatches) #number of files per batch (except last batch will contain remainder)
+for n in range(nbatches):
+    mod_list=dap_mod_files[nfiles_batch*n:nfiles_batch*n+nfiles_batch]
+    mod_list = [entry.replace('sdsswork/lvm', '/lvm') for entry in mod_list]
+    #make list of these files, download
+    with open('temp_file_list.txt', 'w') as f:
+        for item in mod_list:
+            f.write("%s\n" % item)
+    os.system("rsync -avz --no-motd --files-from=temp_file_list.txt rsync://sdss5@dtn.sdss.org/sdsswork sdsswork 2>temp_rsync-errors.txt")
+    try: #if there are errors, try getting zipped version of the model
+        f= open('temp_rsync-errors.txt', 'r')
+        fail_list=list(f)
+        new_list=[]
+        for i in range(len(fail_list)):
+            try:
+                new_list.append(fail_list[i].split('"')[1].replace('.fits', '.fits.gz')) #replace with zipped version
+            except:
+                #do not add row to new list to avoid errors in subsequent steps 
+                pass
+        with open('temp_list_gz.txt', 'w') as f2: #write zipped versions to new file
+            for item in new_list:
+                f2.write("%s\n" % item)
+        os.system("rsync -avz --no-motd --files-from=temp_list_gz.txt rsync://sdss5@dtn.sdss.org/sdsswork sdsswork") #downlad zipped versions
+        for f in new_list:
+            os.system(f"gunzip sdsswork/{f}") #unzip locally
+        os.system(f"rm temp_rsync-errors.txt") #remove temporary files
+        os.system(f"rm temp_list_gz.txt")
+    except:
+        pass
+    for i in range(nfiles_batch*n,nfiles_batch*n+nfiles_batch):
+        try:
+            get_DAP_errors(i, dap_files[i], dap_mod_files[i])
+            os.system(f"rm {dap_mod_files[i]}")
+        except:
+            pass
+# delete list
+os.system("rm temp_file_list.txt")
+#make lists into arrays
 all_fluxes = np.array(all_fluxes)
 all_snr = np.array(all_snr)
 all_ratios = np.array(all_ratios)
@@ -155,5 +197,5 @@ print('Overall median ratio of reported error to residual:', np.nanmedian(all_ra
 for i in range(len(tab_elines)):
     line = tab_elines['line'][i]
     wl = tab_elines['wl'][i]
-    median_ratio = np.nanmedian(flux_err_table[f'{line}_{wl}_flux_err']*1e-16/flux_err_table[f'{line}_{wl}_resid_rms'])
+    median_ratio = np.nanmedian(flux_err_table[f'{line}_{wl}_flux_err']*1e-16/flux_err_table[f'{line}_{wl}_resid_rss'])
     print(f'Median ratio for {line}_{wl}: {median_ratio}')
