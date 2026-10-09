@@ -45,6 +45,104 @@ SKYLINE_BAD_ABS_ALL_LINES = 0.1
 SKYLINE_BAD_ABS_EXCEPT_5577 = 0.30
 SKYLINE_MINOR_ABS_EXCEPT_5577 = 0.1
 
+# Knox wavecal / flatfield: fiber-to-spectrograph map and LSF from reference SFrame
+SLITMAP_REFERENCE_FITS = Path(
+    "/Users/mors/Science/LVM/QA/DR20/test_dap/lvmSFrame-00030930.fits"
+)
+
+SKY_LINE_REST_WAVELENGTH_A: Dict[str, float] = {
+    "sky5577": 5577.34,
+    # "sky6300": 6300.30,
+    # "sky6363": 6363.78,
+    "sky6533": 6533.01,
+    # "sky6553": 6553.56,
+    # "sky6577": 6577.31,
+    # "sky6912": 6912.59,
+    "sky6923": 6923.15,
+    "sky6939": 6939.55,
+    # "sky7358": 7358.64,
+    "sky7392": 7392.18,
+    "sky7914": 7913.66,
+    "sky8344": 8344.57,
+    "sky8399": 8399.23,
+    "sky8827": 8827.07,
+    "sky8988": 8988.42,
+    "sky9552": 9552.52,
+    "sky9719": 9719.78,
+}
+
+# Mean LSF (Angstrom) at each sky line from SLITMAP_REFERENCE_FITS LSF extension
+SKY_LINE_LSF_A: Dict[str, float] = {
+    "sky5577": 1.5551,
+    # "sky6300": 1.3512,
+    # "sky6363": 1.3585,
+    "sky6533": 1.3730,
+    # "sky6553": 1.3741,
+    # "sky6577": 1.3752,
+    # "sky6912": 1.3622,
+    "sky6923": 1.3610,
+    "sky6939": 1.3591,
+    # "sky7358": 1.3133,
+    "sky7392": 1.3138,
+    "sky7914": 1.7637,
+    "sky8344": 1.7357,
+    "sky8399": 1.7319,
+    "sky8827": 1.6968,
+    "sky8988": 1.6840,
+    "sky9552": 1.7054,
+    "sky9719": 1.7598,
+}
+
+WAVECAL_CHANNEL_LINES: Dict[str, Tuple[str, ...]] = {
+    "b": ("sky5577",),
+    "r": (
+        # "sky6300",
+        # "sky6363",
+        "sky6533",
+        # "sky6553",
+        # "sky6577",
+        # "sky6912",
+        "sky6923",
+        "sky6939",
+        # "sky7358",
+        "sky7392",
+    ),
+    "z": (
+        "sky7914",
+        "sky8344",
+        "sky8399",
+        "sky8827",
+        "sky8988",
+        "sky9552",
+        "sky9719",
+    ),
+}
+
+FLATFIELD_SKY_LINES: Tuple[str, ...] = tuple(SKY_LINE_REST_WAVELENGTH_A.keys())
+FLATFIELD_ISSUE_FRAC_THRESHOLD = 0.30
+
+# DAP QA bright emission lines (column prefixes in DAP_flux_error_comparison.fits)
+DAP_BRIGHT_LINE_PREFIXES: Tuple[str, ...] = (
+    "[OII]_3726.03",
+    "[OII]_3728.82",
+    "[OIII]_5006.84",
+    "Hbeta_4861.36",
+    "Halpha_6562.85",
+    "[NII]_6583.45",
+    "[SII]_6716.44",
+    "[SII]_6730.82",
+)
+DAP_SIII_LINE_PREFIXES: Tuple[str, ...] = (
+    "[SIII]_9069.0",
+    "[SIII]_9531.1",
+)
+
+# qa_dap_npfit from DR20_pe_np_comparison_stats.fits (median_perc_diff, percent)
+DAP_NPFIT_WARN_ABS_PERC_DIFF = 5.0
+DAP_NPFIT_BAD_ABS_PERC_DIFF = 15.0
+
+_FIBER_TO_SPECTROGRAPH: Optional[Dict[int, int]] = None
+
 # Bitmask metric order (first -> last == LSB -> MSB by bit index), must match packing order.
 QA_METRIC_COLUMNS_ORDERED: Tuple[str, ...] = (
     "qa_brightstars",
@@ -77,6 +175,24 @@ QA2BIT_TO_STR = {
     QA2Bit.BAD: "MAJOR ISSUE",
     QA2Bit.UNDEFINED: "UNDEFINED",
 }
+
+QA2BIT_FROM_CODE = {
+    "00": QA2Bit.GOOD,
+    "01": QA2Bit.WARNING,
+    "10": QA2Bit.BAD,
+    "11": QA2Bit.UNDEFINED,
+}
+
+
+def parse_qa2bit_flag(value: Any) -> int:
+    """Parse a 2-bit QA code string (00/01/10/11) to QA2Bit."""
+    if value is None:
+        return QA2Bit.UNDEFINED
+    s = str(value).strip()
+    if not s:
+        return QA2Bit.UNDEFINED
+    return QA2BIT_FROM_CODE.get(s, QA2Bit.UNDEFINED)
+
 
 def _to_fits_ascii(value: str) -> str:
     """
@@ -177,10 +293,13 @@ def build_desc_table() -> Table:
                 dict(
                     Metric=name,
                     Bits=bits,
-                    Description=f"Wavelength calibration accuracy in {ch} channel",
-                    # GOOD="TBD",
-                    **{QA2BIT_TO_STR[QA2Bit.WARNING]:"TBD"},
-                    **{QA2BIT_TO_STR[QA2Bit.BAD]: "TBD"},
+                    Description=(
+                        f"Wavelength calibration in {ch} channel from bright sky-line centroids "
+                    ),
+                    # GOOD="<=5% of fibers exceed 1/5 LSF offset on any channel sky line.",
+                    **{QA2BIT_TO_STR[QA2Bit.WARNING]:
+                        ">5% of fibers exceed 1/5 LSF, but <=5% exceed 1 LSF"},
+                    **{QA2BIT_TO_STR[QA2Bit.BAD]: ">5% of fibers exceed 1 LSF on any channel sky line"},
                 )
             )
         elif name == "qa_flatfield":
@@ -188,10 +307,18 @@ def build_desc_table() -> Table:
                 dict(
                     Metric=name,
                     Bits=bits,
-                    Description="Flat-fielding accuracy",
-                    # GOOD="TBD",
-                    **{QA2BIT_TO_STR[QA2Bit.WARNING]:"TBD"},
-                    **{QA2BIT_TO_STR[QA2Bit.BAD]: "TBD"},
+                    Description=(
+                        "Flat-field quality: bright sky-line fluxes "
+                        "consistency between spectrographs"
+                    ),
+                    # GOOD="WARNING/BAD line fractions both below 30%.",
+                    **{QA2BIT_TO_STR[QA2Bit.WARNING]:
+                        f"Median for one spectrograph deviates by >1 sigma for >={int(FLATFIELD_ISSUE_FRAC_THRESHOLD * 100)}% "
+                        f"of bright sky lines, "
+                        f"but all spectrographs are within 2 sigma"},
+                    **{QA2BIT_TO_STR[QA2Bit.BAD]:
+                        f"Median for one spectrograph deviates by >2 sigma, or median for two spectrographs deviate by >1 sigma for "
+                        f">={int(FLATFIELD_ISSUE_FRAC_THRESHOLD * 100)}% of bright sky lines"},
                 )
             )
         elif name == "qa_skycont_sub":
@@ -231,10 +358,14 @@ def build_desc_table() -> Table:
                 dict(
                     Metric=name,
                     Bits=bits,
-                    Description="DAP fit quality: parametric vs non-parametric fit consistency",
-                    # GOOD="TBD",
-                    **{QA2BIT_TO_STR[QA2Bit.WARNING]:"TBD"},
-                    **{QA2BIT_TO_STR[QA2Bit.BAD]: "TBD"},
+                    Description=(
+                        "DAP fit quality: parametric vs non-parametric bright-line consistency "
+                    ),
+                    # GOOD=f"|median_perc_diff| <= {DAP_NPFIT_WARN_ABS_PERC_DIFF}%.",
+                    **{QA2BIT_TO_STR[QA2Bit.WARNING]:
+                        f"Median difference for bright emission lines > {DAP_NPFIT_WARN_ABS_PERC_DIFF}%"},
+                    **{QA2BIT_TO_STR[QA2Bit.BAD]:
+                        f"Median difference for bright emission lines > {DAP_NPFIT_BAD_ABS_PERC_DIFF}%"},
                 )
             )
         elif name == "qa_dap_pmfit":
@@ -242,10 +373,14 @@ def build_desc_table() -> Table:
                 dict(
                     Metric=name,
                     Bits=bits,
-                    Description="DAP fit quality: residuals from Gaussian fits.",
-                    # GOOD="TBD",
-                    **{QA2BIT_TO_STR[QA2Bit.WARNING]: "TBD"},
-                    **{QA2BIT_TO_STR[QA2Bit.BAD]: "TBD"},
+                    Description=(
+                        "DAP fit quality: fit residuals vs "
+                        "DAP parametric flux error for bright emission lines"
+                    ),
+                    # GOOD=">95% of bright lines with mean resid_rss <= 1 sigma.",
+                    **{QA2BIT_TO_STR[QA2Bit.WARNING]:
+                        ">5% of per-fiber measurements exceed 3sigma, but <=5% exceed 5sigma"},
+                    **{QA2BIT_TO_STR[QA2Bit.BAD]: ">5% of per-fiber measurements exceed 5sigma"},
                 )
             )
         elif name == "qa_visual_drp":
@@ -515,26 +650,328 @@ def compute_metric_sky_emission_line_subtraction(
     return QA2Bit.GOOD
 
 
+def get_fiber_to_spectrograph() -> Dict[int, int]:
+    """fiberid -> spectrographid (1, 2, 3) from reference SLITMAP."""
+    global _FIBER_TO_SPECTROGRAPH
+    if _FIBER_TO_SPECTROGRAPH is not None:
+        return _FIBER_TO_SPECTROGRAPH
+    if not SLITMAP_REFERENCE_FITS.exists():
+        _FIBER_TO_SPECTROGRAPH = {}
+        return _FIBER_TO_SPECTROGRAPH
+    from astropy.io import fits
+
+    with fits.open(SLITMAP_REFERENCE_FITS, memmap=True) as hdul:
+        slitmap = hdul["SLITMAP"].data
+        col = "spectrographid" if "spectrographid" in slitmap.dtype.names else "spectrographID"
+        _FIBER_TO_SPECTROGRAPH = {
+            int(row["fiberid"]): int(row[col]) for row in slitmap
+        }
+    return _FIBER_TO_SPECTROGRAPH
+
+
+def knox_cframe_path(knox_dir: Path, expnum: int) -> Path:
+    return knox_dir / f"lvmCFrame-{expnum:08d}.txt"
+
+
+def read_knox_cframe_table(path: Path) -> Optional[Table]:
+    """Load per-fiber Knox Gaussian-fit table for one exposure."""
+    if not path.exists():
+        return None
+    from astropy.io import ascii
+
+    return ascii.read(path, format="fixed_width_two_line")
+
+
 def compute_metric_wavelength_calibration_accuracy(
-    gaussian_fit_row: Optional[Dict[str, Any]], channel: str
+    knox_table: Optional[Table], channel: str
 ) -> int:
-    # Placeholder: criteria TBD
-    return QA2Bit.UNDEFINED
+    """
+    Wavelength calibration QA for one spectroscopic channel (b/r/z).
+
+    Per fiber, flag if any channel sky line has |wave - rest| > LSF/5 or > LSF.
+    GOOD: <=5% fibers exceed LSF/5; WARNING: >5% exceed LSF/5 but <=5% exceed LSF;
+    BAD: >5% exceed LSF.
+    """
+    if knox_table is None:
+        return QA2Bit.UNDEFINED
+    lines = WAVECAL_CHANNEL_LINES.get(channel)
+    if not lines:
+        return QA2Bit.UNDEFINED
+
+    n_fibers = len(knox_table)
+    if n_fibers == 0:
+        return QA2Bit.UNDEFINED
+
+    exceeds_lsf5 = np.zeros(n_fibers, dtype=bool)
+    exceeds_lsf1 = np.zeros(n_fibers, dtype=bool)
+    has_valid = np.zeros(n_fibers, dtype=bool)
+
+    for line in lines:
+        wave_col = f"wave_{line}"
+        if wave_col not in knox_table.colnames:
+            return QA2Bit.UNDEFINED
+        wave = np.asarray(knox_table[wave_col], dtype=float)
+        rest = SKY_LINE_REST_WAVELENGTH_A[line]
+        lsf = SKY_LINE_LSF_A[line]
+        finite = np.isfinite(wave)
+        has_valid |= finite
+        delta = np.abs(wave - rest)
+        exceeds_lsf5 |= finite & (delta > lsf / 5.0)
+        exceeds_lsf1 |= finite & (delta > lsf)
+
+    n_valid = int(np.sum(has_valid))
+    if n_valid == 0:
+        return QA2Bit.UNDEFINED
+
+    frac_lsf5 = float(np.sum(exceeds_lsf5 & has_valid)) / n_valid
+    frac_lsf1 = float(np.sum(exceeds_lsf1 & has_valid)) / n_valid
+
+    if frac_lsf1 > 0.05:
+        return QA2Bit.BAD
+    if frac_lsf5 > 0.05:
+        return QA2Bit.WARNING
+    return QA2Bit.GOOD
 
 
-def compute_metric_flat_fielding_accuracy(gaussian_fit_row: Optional[Dict[str, Any]]) -> int:
-    # Placeholder: criteria TBD
-    return QA2Bit.UNDEFINED
+def classify_flatfield_line(
+    med_flux: Dict[int, float], std_flux: Dict[int, float]
+) -> Optional[int]:
+    """
+    Classify one sky line from spectrograph median flux and per-spec std.
+
+    sigma = median(std per spectrograph); offsets = |med_s - median(meds)| / sigma.
+    """
+    if not all(sid in med_flux and sid in std_flux for sid in (1, 2, 3)):
+        return None
+    sigma = float(np.median([std_flux[1], std_flux[2], std_flux[3]]))
+    if sigma <= 0 or not np.isfinite(sigma):
+        return None
+    meds = [med_flux[1], med_flux[2], med_flux[3]]
+    ref = float(np.median(meds))
+    offsets = [abs(m - ref) / sigma for m in meds]
+    n_over_1 = sum(o > 1.0 for o in offsets)
+    n_over_2 = sum(o > 2.0 for o in offsets)
+    if n_over_2 >= 1 or n_over_1 >= 2:
+        return QA2Bit.BAD
+    if n_over_1 == 1:
+        return QA2Bit.WARNING
+    return QA2Bit.GOOD
 
 
-def compute_metric_dap_param_np_consistency(dap_row: Optional[Dict[str, Any]]) -> int:
-    # Placeholder: criteria TBD
-    return QA2Bit.UNDEFINED
+def flatfield_line_classes(
+    knox_table: Table, spec_ids: np.ndarray
+) -> list[int]:
+    """Classify each sky line for flat-field consistency."""
+    line_classes: list[int] = []
+    for line in FLATFIELD_SKY_LINES:
+        flux_col = f"flux_{line}"
+        if flux_col not in knox_table.colnames:
+            continue
+        flux = np.asarray(knox_table[flux_col], dtype=float)
+        med_flux: Dict[int, float] = {}
+        std_flux: Dict[int, float] = {}
+        for sid in (1, 2, 3):
+            sel = spec_ids == sid
+            if not np.any(sel):
+                continue
+            fvals = flux[sel]
+            ffinite = fvals[np.isfinite(fvals)]
+            if len(ffinite) < 2:
+                continue
+            std_val = float(np.nanstd(ffinite))
+            if std_val <= 0 or not np.isfinite(std_val):
+                continue
+            med_flux[sid] = float(np.nanmedian(ffinite))
+            std_flux[sid] = std_val
+        line_class = classify_flatfield_line(med_flux, std_flux)
+        if line_class is not None:
+            line_classes.append(line_class)
+    return line_classes
 
 
-def compute_metric_dap_gaussian_fit_residuals(dap_row: Optional[Dict[str, Any]]) -> int:
-    # Placeholder: criteria TBD
-    return QA2Bit.UNDEFINED
+def compute_metric_flat_fielding_accuracy(knox_table: Optional[Table]) -> int:
+    """
+    Flat-field QA from all Knox sky-line fluxes (no per-channel split).
+
+    Per line: same 1-sigma / 2-sigma spectrograph consistency rules.
+    Exposure: return worst severity whose line fraction is >= 30%
+    (BAD checked before WARNING).
+    """
+    if knox_table is None:
+        return QA2Bit.UNDEFINED
+    if "fiberid" not in knox_table.colnames:
+        return QA2Bit.UNDEFINED
+
+    fiber_map = get_fiber_to_spectrograph()
+    if not fiber_map:
+        return QA2Bit.UNDEFINED
+
+    fiberids = np.asarray(knox_table["fiberid"], dtype=int)
+    spec_ids = np.array([fiber_map.get(int(fid), -1) for fid in fiberids], dtype=int)
+
+    line_classes = flatfield_line_classes(knox_table, spec_ids)
+    if not line_classes:
+        return QA2Bit.UNDEFINED
+
+    n_lines = len(line_classes)
+    frac_bad = sum(c == QA2Bit.BAD for c in line_classes) / n_lines
+    frac_warn = sum(c == QA2Bit.WARNING for c in line_classes) / n_lines
+
+    if frac_bad >= FLATFIELD_ISSUE_FRAC_THRESHOLD:
+        return QA2Bit.BAD
+    if frac_warn >= FLATFIELD_ISSUE_FRAC_THRESHOLD:
+        return QA2Bit.WARNING
+    return QA2Bit.GOOD
+
+
+def dap_bright_line_prefixes(*, include_siii: bool = False) -> Tuple[str, ...]:
+    if include_siii:
+        return DAP_BRIGHT_LINE_PREFIXES + DAP_SIII_LINE_PREFIXES
+    return DAP_BRIGHT_LINE_PREFIXES
+
+
+def _table_row_float(row: Any, col: str) -> Optional[float]:
+    if col not in row.colnames:
+        return None
+    return safe_float(row[col])
+
+
+def classify_from_sigma_fractions(
+    frac_exceed_1sigma: float, frac_exceed_3sigma: float, n_samples: int
+) -> int:
+    """Tiered QA from fractions exceeding 1-sigma and 3-sigma thresholds."""
+    if n_samples <= 0:
+        return QA2Bit.UNDEFINED
+    if frac_exceed_3sigma > 0.05:
+        return QA2Bit.BAD
+    if frac_exceed_1sigma > 0.05:
+        return QA2Bit.WARNING
+    return QA2Bit.GOOD
+
+
+def read_pe_np_comparison_stats(path: Path) -> Dict[int, float]:
+    """
+    Load median parametric vs non-parametric flux difference per exposure.
+
+    Returns {expnum: median_perc_diff} from DR20_pe_np_comparison_stats.fits.
+    """
+    if not path.exists():
+        return {}
+    table = Table.read(path)
+    if "expnum" not in table.colnames or "median_perc_diff" not in table.colnames:
+        return {}
+    out: Dict[int, float] = {}
+    for row in table:
+        expnum = normalize_expnum(row["expnum"])
+        if expnum is None:
+            continue
+        val = safe_float(row["median_perc_diff"])
+        if val is not None:
+            out[expnum] = val
+    return out
+
+
+def compute_metric_dap_npfit_from_median_perc_diff(
+    median_perc_diff: Optional[float],
+) -> int:
+    """
+    NP vs parametric consistency from exposure-level median percent flux difference.
+
+    WARNING: |median_perc_diff| > 5%; BAD: |median_perc_diff| > 15%.
+    """
+    if median_perc_diff is None:
+        return QA2Bit.UNDEFINED
+    abs_diff = abs(median_perc_diff)
+    if abs_diff > DAP_NPFIT_BAD_ABS_PERC_DIFF:
+        return QA2Bit.BAD
+    if abs_diff > DAP_NPFIT_WARN_ABS_PERC_DIFF:
+        return QA2Bit.WARNING
+    return QA2Bit.GOOD
+
+
+def read_dap_flags_fits(path: Path) -> Dict[int, Dict[str, str]]:
+    """
+    Load per-exposure DAP QA flags from DAP_flux_comparison_flags.fits.
+
+    Returns {expnum: {"PM_NP_flag": "01", "resid_flag": "10", ...}}.
+    """
+    table = Table.read(path)
+    out: Dict[int, Dict[str, str]] = {}
+    for row in table:
+        expnum = normalize_expnum(row["expnum"])
+        if expnum is None:
+            continue
+        rec: Dict[str, str] = {}
+        for col in ("PM_NP_flag", "resid_flag"):
+            if col in table.colnames:
+                rec[col] = str(row[col]).strip()
+        out[expnum] = rec
+    return out
+
+
+def read_dap_error_comparison_by_expnum(
+    error_path: Path, flags_path: Path
+) -> Dict[int, Table]:
+    """
+    Load DAP_flux_error_comparison.fits rows keyed by expnum.
+
+    Row order matches DAP_flux_comparison_flags.fits (same index -> same exposure).
+    """
+    if not error_path.exists() or not flags_path.exists():
+        return {}
+    error_table = Table.read(error_path)
+    flags_table = Table.read(flags_path)
+    if len(error_table) != len(flags_table):
+        raise SystemExit(
+            f"DAP error comparison ({len(error_table)} rows) and flags "
+            f"({len(flags_table)} rows) must have the same length."
+        )
+    out: Dict[int, Table] = {}
+    for i in range(len(flags_table)):
+        expnum = normalize_expnum(flags_table["expnum"][i])
+        if expnum is None:
+            continue
+        out[expnum] = error_table[i]
+    return out
+
+
+def compute_metric_dap_pmfit_from_error_row(
+    error_row: Optional[Table], *, include_siii: bool = False
+) -> int:
+    """
+    Parametric-fit residual QA from exposure-level bright-line stats.
+
+    Uses mean resid_rss and mean flux_err per line from DAP_flux_error_comparison.fits.
+    resid_sigma = resid_rss / (flux_err * 1e-16), compared to 1-sigma and 3-sigma bands.
+    """
+    if error_row is None:
+        return QA2Bit.UNDEFINED
+
+    exceed_1 = 0
+    exceed_3 = 0
+    n_valid = 0
+    for prefix in dap_bright_line_prefixes(include_siii=include_siii):
+        flux_err = _table_row_float(error_row, f"{prefix}_flux_err")
+        resid = _table_row_float(error_row, f"{prefix}_resid_rss")
+        if resid is None:
+            resid = _table_row_float(error_row, f"{prefix}_resid_rms")
+        if flux_err is None or resid is None or flux_err <= 0 or resid < 0:
+            continue
+        sigma = flux_err * 1e-16
+        if sigma <= 0:
+            continue
+        resid_sigma = resid / sigma
+        n_valid += 1
+        if resid_sigma > 5.0:
+            exceed_3 += 1
+        if resid_sigma > 3.0:
+            exceed_1 += 1
+
+    if n_valid == 0:
+        return QA2Bit.UNDEFINED
+    return classify_from_sigma_fractions(
+        exceed_1 / n_valid, exceed_3 / n_valid, n_valid
+    )
 
 
 def compute_metric_a_sky_brightness(
@@ -961,6 +1398,55 @@ def main() -> int:
         action="store_true",
         help="Do not write the Excel file.",
     )
+    parser.add_argument(
+        "--dap-flags",
+        type=Path,
+        default=None,
+        help=(
+            "DAP flux comparison flags FITS (PM_NP_flag, resid_flag per expnum). "
+            "Default: <metrics-dir>/DAP_flux_comparison_flags.fits"
+        ),
+    )
+    parser.add_argument(
+        "--dap-error-comparison",
+        type=Path,
+        default=None,
+        help=(
+            "DAP flux/error/residual measurements per exposure. "
+            "Default: <metrics-dir>/DAP_flux_error_comparison.fits"
+        ),
+    )
+    parser.add_argument(
+        "--dap-use-flags",
+        action="store_true",
+        help=(
+            "Use pre-computed PM_NP_flag and resid_flag from --dap-flags for both "
+            "qa_dap_npfit and qa_dap_pmfit (skip error-comparison computation)."
+        ),
+    )
+    parser.add_argument(
+        "--dap-include-siii",
+        action="store_true",
+        help="Include [SIII] 9069 and 9531 lines in DAP pmfit bright-line set.",
+    )
+    parser.add_argument(
+        "--dap-pe-np-stats",
+        type=Path,
+        default=None,
+        help=(
+            "Parametric vs non-parametric flux comparison stats per exposure. "
+            "Default: <metrics-dir>/DR20_pe_np_comparison_stats.fits"
+        ),
+    )
+    parser.add_argument(
+        "--knox-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Knox per-exposure lvmCFrame tables (wavecal / flatfield). "
+            "Default: <metrics-dir>/from_knox"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -978,13 +1464,25 @@ def main() -> int:
         xlsx_path = out_path.with_suffix(".xlsx")
 
     pointings_path = metrics_dir / "dr20_pointings_final_v1.2.0.csv"
-    sky_path = metrics_dir / "drpqa_metrics_dr20_sky.dat"
+    sky_path = metrics_dir / "drpqa_metrics_dr20_sky_final.dat"
     jumps_tar_path = metrics_dir / "DR20_json_jumps.tar.gz"
     phot_path = metrics_dir / "dr20_photometry.csv"
     cont_path = metrics_dir / "cont_snr_dr20_.parquet"
     visual_path = metrics_dir / "DR20_visual_QC.csv"
     stars_cache_path = metrics_dir / "stars_cache.pkl"
-    gaussian_fit_path = metrics_dir / "lvm_dr20_sky_lines_gaussian_fitting.csv"
+    if args.dap_flags is not None:
+        dap_flags_path = args.dap_flags
+    else:
+        dap_flags_path = metrics_dir / "DAP_flux_comparison_flags.fits"
+    if args.dap_error_comparison is not None:
+        dap_error_path = args.dap_error_comparison
+    else:
+        dap_error_path = metrics_dir / "DAP_flux_error_comparison.fits"
+    if args.dap_pe_np_stats is not None:
+        dap_pe_np_stats_path = args.dap_pe_np_stats
+    else:
+        dap_pe_np_stats_path = metrics_dir / "DR20_pe_np_comparison_stats.fits"
+    knox_dir = args.knox_dir if args.knox_dir is not None else metrics_dir / "from_knox"
 
     master = read_pointings_master(pointings_path)
     expnums = sorted(master.keys())
@@ -995,15 +1493,13 @@ def main() -> int:
     cont_snr = read_cont_snr_parquet(cont_path)
     visual_rows = read_visual_qc(visual_path)
     stars_cache = load_stars_cache(stars_cache_path) if stars_cache_path.exists() else {}
-    gaussian_fit_rows: Dict[int, Dict[str, Any]] = {}
-    if gaussian_fit_path.exists():
-        with gaussian_fit_path.open(newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                expnum = normalize_expnum(row.get("expnum"))
-                if expnum is None:
-                    continue
-                gaussian_fit_rows[expnum] = row
+    dap_flags_rows = read_dap_flags_fits(dap_flags_path) if dap_flags_path.exists() else {}
+    dap_pe_np_stats = read_pe_np_comparison_stats(dap_pe_np_stats_path)
+    dap_error_by_expnum: Dict[int, Table] = {}
+    if not args.dap_use_flags:
+        dap_error_by_expnum = read_dap_error_comparison_by_expnum(
+            dap_error_path, dap_flags_path
+        )
 
     records: Dict[str, list] = {
         "expnum": [],
@@ -1082,13 +1578,32 @@ def main() -> int:
         qa_visual_drp = parse_visual_flag(spectra_raw)
         qa_visual_dap = parse_visual_flag(dap_raw)
 
-        gf_row = gaussian_fit_rows.get(expnum)
-        qa_wavecal_b = compute_metric_wavelength_calibration_accuracy(gf_row, "b")
-        qa_wavecal_r = compute_metric_wavelength_calibration_accuracy(gf_row, "r")
-        qa_wavecal_z = compute_metric_wavelength_calibration_accuracy(gf_row, "z")
-        qa_flatfield = compute_metric_flat_fielding_accuracy(gf_row)
-        qa_dap_npfit = compute_metric_dap_param_np_consistency(None)
-        qa_dap_pmfit = compute_metric_dap_gaussian_fit_residuals(None)
+        knox_table = read_knox_cframe_table(knox_cframe_path(knox_dir, expnum))
+        qa_wavecal_b = compute_metric_wavelength_calibration_accuracy(knox_table, "b")
+        qa_wavecal_r = compute_metric_wavelength_calibration_accuracy(knox_table, "r")
+        qa_wavecal_z = compute_metric_wavelength_calibration_accuracy(knox_table, "z")
+        qa_flatfield = compute_metric_flat_fielding_accuracy(knox_table)
+        dap_row = dap_flags_rows.get(expnum)
+        if args.dap_use_flags:
+            qa_dap_npfit = parse_qa2bit_flag(
+                dap_row.get("PM_NP_flag") if dap_row else None
+            )
+            qa_dap_pmfit = parse_qa2bit_flag(
+                dap_row.get("resid_flag") if dap_row else None
+            )
+        else:
+            if dap_pe_np_stats:
+                qa_dap_npfit = compute_metric_dap_npfit_from_median_perc_diff(
+                    dap_pe_np_stats.get(expnum)
+                )
+            else:
+                qa_dap_npfit = parse_qa2bit_flag(
+                    dap_row.get("PM_NP_flag") if dap_row else None
+                )
+            qa_dap_pmfit = compute_metric_dap_pmfit_from_error_row(
+                dap_error_by_expnum.get(expnum),
+                include_siii=args.dap_include_siii,
+            )
 
         qa_by_metric = {
             "qa_brightstars": qa_bright_stars,

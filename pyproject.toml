@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lvmqa"
+dynamic = ["version"]
+description = "Quality-assurance pipeline for SDSS-V LVM data (SFrames, DAP, drpall)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "astropy>=5", "plotly>=5", "openpyxl"]
+
+[project.optional-dependencies]
+hipparcos = ["astroquery"]
+
+[project.scripts]
+lvmqa = "lvmqa.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "lvmqa.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["lvmqa*"]
