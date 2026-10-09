@@ -201,16 +201,24 @@ class FlatField(Metric):
                     block_rel.setdefault(b, []).append(float(np.median(v)) / ref - 1.0)
 
         vals = {"mode": mode}
-        D, Derr = {}, {}
+        D, e_med, e_scat = {}, {}, {}
         for key, v in rel.items():
             if not v:
                 continue
             v = np.asarray(v)
             D[key] = float(np.median(v))
-            e_med = float(np.median(rel_err[key]))
-            e_scatter = 1.2533 * float(_nmad(v)) / np.sqrt(v.size) if v.size >= 3 else e_med
-            Derr[key] = max(e_med, e_scatter)
+            e_med[key] = float(np.median(rel_err[key]))
+            e_scat[key] = 1.2533 * float(_nmad(v)) / np.sqrt(v.size) if v.size >= 3 else e_med[key]
             vals[f"off_sp{key[0]}_{key[1]}"] = 100.0 * D[key]
+        # Significance uses the *typical* uncertainty of the channel (median over the three
+        # spectrographs), not the error of the tested spectrograph itself: a broken spectrograph
+        # has a huge fiber-to-fiber and line-to-line scatter, which would otherwise make even a
+        # factor-of-40 offset "insignificant" (e.g. expnum 7333, sp1 z, DRP 1.2.0).
+        Derr = {}
+        for key in D:
+            same = [k for k in D if k[1] == key[1]]
+            Derr[key] = max(float(np.median([e_med[k] for k in same])),
+                            float(np.median([e_scat[k] for k in same])))
         if block_dev:
             bmed = {b: float(np.median(v)) for b, v in block_dev.items()}
             wb = max(bmed, key=bmed.get)
