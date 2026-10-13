@@ -749,7 +749,7 @@ def _AsinhNormCompat(linear_width, vmin, vmax):  # noqa: N802 - factory (matplot
     return _make_asinh_compat()(linear_width, vmin, vmax)
 
 
-def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None):
+def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
     """Halpha maps of the tiles, one panel per sky region (tiles within 2 deg), max_panels largest.
 
     Regions are found from the tile centres (``coords`` = {expnum: (ra, dec)} from drpall; DAP
@@ -757,7 +757,7 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None):
     exposure of each pointing in the shown regions), so the page stays cheap for large runs."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
-    from .metrics.dap_fluxmap import _payload_from_dap
+    from .metrics.dap_fluxmap import _halpha_map_job, halpha_map
     from .paths import dap_path
     coords = coords or {}
     cand, files = [], []
@@ -769,10 +769,11 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None):
     if not cand:
         return
 
-    class _Maps(dict):  # lazily read DAP Halpha maps: pts[i] = (row, payload, flux)
+    class _Maps(dict):  # Halpha maps (cache or DAP file), read on demand: pts[i] = (row, payload, flux)
         def __missing__(self, i):
-            pl = _payload_from_dap(files[i])
-            v = (cand[i], pl, np.asarray(pl["flux"], float))
+            r = cand[i]
+            pl = halpha_map(cfg, int(r["tileid"]), int(r["mjd"]), int(r["expnum"]), files[i])
+            v = (r, pl, np.asarray(pl["flux"], float))
             self[i] = v
             return v
 
@@ -808,60 +809,138 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None):
     gidx = np.where(good)[0]
     groups = [gidx[g] for g in _clusters(ra0[good], de0[good])]
     shown = groups[:max_panels]
+    # all exposures of the shown regions are averaged in the image: read their maps (Halpha map
+    # cache of the run; missing ones from the DAP files, in parallel)
+    need = [int(i) for g in shown for i in g if int(i) not in pts]
+    if nproc > 1 and len(need) > 4:
+        from concurrent.futures import ProcessPoolExecutor
+        jobs = [(cfg, int(cand[i]["tileid"]), int(cand[i]["mjd"]), int(cand[i]["expnum"])) for i in need]
+        with ProcessPoolExecutor(max_workers=nproc) as ex:
+            got = dict(ex.map(_halpha_map_job, jobs, chunksize=4))
+        for i in need:
+            pl = got.get(int(cand[i]["expnum"]))
+            if pl is not None:
+                pts[i] = (cand[i], pl, np.asarray(pl["flux"], float))
     nc = 1 if len(shown) == 1 else (2 if len(shown) <= 4 else 3)
     nr = int(np.ceil(len(shown) / nc))
     fig, axes = plt.subplots(nr, nc, figsize=(11.7, 8.3), squeeze=False)
     by = {int(r["expnum"]): r for r in supl}
-    sc = None
+    flagged = ("MAJOR ISSUE", "WARNING")
+    sev = {"MAJOR ISSUE": 3, "WARNING": 2, "GOOD": 1}
+    stat = {i: (str(cand[i]["qa_fluxmap"]) if "qa_fluxmap" in qa.colnames else "") for i in range(len(cand))}
     for ax, g in zip(axes.flat, shown):
-        first = [g[sub[0]] for sub in _clusters(ra0[g], de0[g], link=0.05)]
-        norm = _norm(first)
-        for i in first:
-            row, pl, lf = pts[i]
-            sc = ax.scatter(pl["ra"], pl["dec"], c=lf, s=3 if len(first) > 3 else 12, cmap="magma",
-                            norm=norm, lw=0)
-        # repeated pointings (centres < 0.05 deg apart) share one outline (worst status) and label
-        sev = {"MAJOR ISSUE": 3, "WARNING": 2, "GOOD": 1}
+        g = [int(i) for i in g]
+        ra_c, de_c = float(np.median(ra0[g])), float(np.median(de0[g]))
+        cos0 = max(np.cos(np.deg2rad(de_c)), 1e-3)
+        xs, ys, vs = [], [], []
+        for i in g:
+            pl, lf = pts[i][1], pts[i][2]
+            ok = np.isfinite(pl["ra"]) & np.isfinite(pl["dec"]) & np.isfinite(lf)
+            dra = (np.asarray(pl["ra"], float)[ok] - ra_c + 180.0) % 360.0 - 180.0  # RA wrap
+            xs.append(dra * cos0)
+            ys.append(np.asarray(pl["dec"], float)[ok] - de_c)
+            vs.append(lf[ok])
+        x, y, v = np.concatenate(xs), np.concatenate(ys), np.concatenate(vs)
+        pad = 2 * _FIB_CELL_R
+        xl, yl = (x.min() - pad, x.max() + pad), (y.min() - pad, y.max() + pad)
+        img = _fiber_image(x, y, v, xl, yl)
+        ext = (ra_c + xl[0] / cos0, ra_c + xl[1] / cos0, de_c + yl[0], de_c + yl[1])
+        cmap = plt.get_cmap("magma").copy() if hasattr(plt.get_cmap("magma"), "copy") else plt.get_cmap("magma")
+        cmap.set_bad(alpha=0.0)
+        im = ax.imshow(np.ma.masked_invalid(img), origin="lower", extent=ext, cmap=cmap, norm=_norm(g),
+                       interpolation="none", aspect=1.0 / cos0)
+        # outlines and labels only for WARNING / MAJOR pointings (repeated pointings, centres
+        # < 0.05 deg apart, share one outline = worst status); outlines rasterized, text vector
         for sub in _clusters(ra0[g], de0[g], link=0.05):
-            idx = g[sub]
-            lines, worst = [], ""
-            for i in idx:
-                row = cand[i]
-                e = int(row["expnum"])
-                st = str(row["qa_fluxmap"]) if "qa_fluxmap" in qa.colnames else ""
-                sv = _f(by[e]["fluxmap_s_dex"]) if e in by and "fluxmap_s_dex" in supl.colnames else np.nan
-                lines.append(f"{e} {sv:+.3f}" + ("" if st == "GOOD" else f" {st[:4]}"))
-                worst = st if sev.get(st, 0) > sev.get(worst, 0) else worst
-            pl = pts[idx[0]][1]
+            idx = [g[k] for k in sub]
+            bad = [i for i in idx if stat[i] in flagged]
+            if not bad:
+                continue
+            worst = max((stat[i] for i in bad), key=lambda s_: sev[s_])
+            pl = pts[bad[0]][1]
             ok = np.isfinite(pl["ra"]) & np.isfinite(pl["dec"])
-            h = _hull(np.c_[pl["ra"][ok], pl["dec"][ok]])
+            rr = ra_c + (np.asarray(pl["ra"], float)[ok] - ra_c + 180.0) % 360.0 - 180.0
+            h = _hull(np.c_[rr, np.asarray(pl["dec"], float)[ok]])
             if len(h) > 2:
-                ax.plot(np.r_[h[:, 0], h[0, 0]], np.r_[h[:, 1], h[0, 1]], color=CCOL.get(worst, "0.5"), lw=1.8)
-            ax.text(np.median(ra0[idx]), np.median(de0[idx]), "\n".join(lines), ha="center", va="center",
-                    fontsize=5.5 if len(idx) < 6 else 4.5, color="k", family="monospace",
-                    bbox=dict(facecolor=CCOL.get(worst, "0.8"), alpha=0.5, lw=0, pad=1.2))
-        cb = fig.colorbar(sc, ax=ax, shrink=0.7, pad=0.02)
+                ax.plot(np.r_[h[:, 0], h[0, 0]], np.r_[h[:, 1], h[0, 1]], color=CCOL[worst], lw=1.6,
+                        rasterized=True)
+            lines = []
+            for i in bad:
+                e = int(cand[i]["expnum"])
+                sv = _f(by[e]["fluxmap_s_dex"]) if e in by and "fluxmap_s_dex" in supl.colnames else np.nan
+                lines.append(f"{e} {sv:+.3f} {stat[i][:4]}")
+            ax.text(ra_c + (float(np.median(ra0[bad])) - ra_c + 180.0) % 360.0 - 180.0, float(np.median(de0[bad])),
+                    "\n".join(lines), ha="center", va="center", fontsize=5.5, color="k", family="monospace",
+                    bbox=dict(facecolor=CCOL[worst], alpha=0.6, lw=0, pad=1.2), clip_on=True)
+        cb = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
         cb.ax.tick_params(labelsize=6)
-        ax.invert_xaxis()
-        ax.set_aspect(1.0 / np.cos(np.deg2rad(np.median(de0[g]))), adjustable="datalim")
+        ax.set_xlim(ext[1], ext[0])  # RA increases to the left
+        ax.set_ylim(ext[2], ext[3])
         ax.set_xlabel("RA [deg]", fontsize=7)
         ax.set_ylabel("Dec [deg]", fontsize=7)
         ax.tick_params(labelsize=6)
-        ax.set_title(f"{len(g)} exposure(s) around RA {np.median(ra0[g]):.1f}, Dec {np.median(de0[g]):+.1f}",
-                     fontsize=7)
+        cnt = {c: sum(stat[i] == c for i in g) for c in ("MAJOR ISSUE", "WARNING", "GOOD")}
+        nund = len(g) - sum(cnt.values())
+        ax.set_title(f"{len(g)} exposures around RA {ra_c:.1f}, Dec {de_c:+.1f}\n{cnt['MAJOR ISSUE']} MAJOR, "
+                     f"{cnt['WARNING']} WARNING, {cnt['GOOD']} GOOD, {nund} UNDEFINED", fontsize=7)
     for ax in list(axes.flat)[len(shown):]:
         ax.axis("off")
-    fig.legend(handles=[Line2D([], [], color=CCOL[c], lw=2, label=c) for c in CLASSES] +
-               [Line2D([], [], color="0.5", lw=2, label="UNDEFINED")], loc="lower center", ncol=4, fontsize=7,
-               title="outline = qa_fluxmap (worst of repeated pointings); label = expnum, s [dex]; map = first "
-                     "exposure; colour = F(Halpha) [1e-16 erg/s/cm2] (DAP NP; asinh stretch, own scale per panel)",
+    fig.legend(handles=[Line2D([], [], color=CCOL[c], lw=2, label=c) for c in flagged], loc="lower center",
+               ncol=2, fontsize=7,
+               title="outline + label (expnum, s [dex]) = qa_fluxmap WARNING / MAJOR pointings only;  image = "
+                     "F(Halpha) [1e-16 erg/s/cm2] (DAP NP), mean of all overlapping fibers of all exposures; asinh "
+                     "stretch, own scale per panel",
                title_fontsize=7, frameon=False)
-    fig.subplots_adjust(bottom=0.13)
+    fig.subplots_adjust(bottom=0.12)
     extra = f" ({len(groups) - len(shown)} more regions not shown)" if len(groups) > len(shown) else ""
     fig.suptitle("qa_fluxmap: Halpha maps of the tiles (DAP NP), fitted flux-scale offsets s and status" + extra,
                  fontsize=10)
-    pdf.savefig(fig)
+    pdf.savefig(fig, dpi=200)
     plt.close(fig)
+
+
+_FIB_R = 35.3 / 2 / 3600.0               # LVM fiber radius [deg]
+_FIB_CELL_R = 37.0 / np.sqrt(3) / 3600.0  # circumradius of the hexagonal fiber cell (pitch 37") [deg]
+
+
+def _fiber_image(x, y, v, xlim, ylim, npix=900):
+    """Raster map of fiber values (x, y in deg on the sky plane, x = dRA cos(dec0)): a pixel takes
+    the mean of all fibers whose disk (radius 17.65") covers its centre (uniform within a fiber;
+    overlapping fibers of different exposures are averaged). Pixels in the small gaps between the
+    fibers of a tile take the mean of the fibers within the hexagonal-cell radius (21.4"); pixels
+    without fiber coverage are NaN. Pixel size: longest side / npix, at least fiber radius / 6."""
+    w, h = xlim[1] - xlim[0], ylim[1] - ylim[0]
+    pix = max(max(w, h) / npix, _FIB_R / 6.0)
+    nx, ny = max(int(np.ceil(w / pix)), 1), max(int(np.ceil(h / pix)), 1)
+    fx, fy = (x - xlim[0]) / pix, (y - ylim[0]) / pix  # fiber centres in pixel units
+    ix, iy = np.floor(fx).astype(int), np.floor(fy).astype(int)
+
+    def accumulate(radius):
+        r = radius / pix
+        k = int(np.ceil(r)) + 1
+        s = np.zeros(nx * ny)
+        c = np.zeros(nx * ny)
+        for oy in range(-k, k + 1):
+            for ox in range(-k, k + 1):
+                jx, jy = ix + ox, iy + oy
+                d2 = (jx + 0.5 - fx) ** 2 + (jy + 0.5 - fy) ** 2
+                m = (jx >= 0) & (jx < nx) & (jy >= 0) & (jy < ny)
+                m &= (d2 <= r * r) | ((ox == 0) & (oy == 0))  # a fiber always covers its own pixel
+                if not m.any():
+                    continue
+                flat = jy[m] * nx + jx[m]
+                s += np.bincount(flat, weights=v[m], minlength=nx * ny)
+                c += np.bincount(flat, minlength=nx * ny)
+        return s, c
+
+    s, c = accumulate(_FIB_R)
+    img = np.full(nx * ny, np.nan)
+    ok = c > 0
+    img[ok] = s[ok] / c[ok]
+    s2, c2 = accumulate(max(_FIB_CELL_R, 1.0 * pix))
+    gap = ~ok & (c2 > 0)
+    img[gap] = s2[gap] / c2[gap]
+    return img.reshape(ny, nx)
 
 
 def _criteria_text(metric, cfg, width=190) -> str:
@@ -904,7 +983,22 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
     drpall = load_drpall(cfg)
     rows = {int(r["expnum"]): _row_to_dict(r) for r in select_exposures(drpall, list(qa["expnum"]))}
     sup = {int(r["expnum"]): {c: r[c] for c in supl.colnames} for r in supl}
+    # Example selection. Every plotted exposure costs a full read (SFrame windows, DAP tables and
+    # one gzip pass through the DAP output cube, ~5-6 s), so the examples are taken from ONE random
+    # ranking of all exposures: each metric/status uses the n best-ranked exposures with that
+    # status, preferring exposures already picked for another metric. Metrics therefore share
+    # their examples wherever the statuses allow (~40 exposures to read for n = 5, independent of
+    # the run size, instead of up to 16 metrics x 3 statuses x n = 240). Exposures without
+    # a DAP output file are used for the DAP-output metrics only if nothing else is available.
     rng = random.Random(seed)
+    order = [int(e) for e in qa["expnum"]]
+    rng.shuffle(order)
+    rank = {e: i for i, e in enumerate(order)}
+
+    def _has(e, key):
+        v = sup[e].get(key, True)
+        return bool(v) if v is not None and not (isinstance(v, float) and np.isnan(v)) else True
+
     jobs: Dict[int, List[Tuple]] = {}
     picked: Dict[str, Dict[str, List[int]]] = {}
     for metric in EXTRACTORS:
@@ -913,11 +1007,17 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
         picked[metric] = {}
         for cls in CLASSES:
             ex = [int(e) for e, f in zip(qa["expnum"], qa[metric]) if str(f) == cls and int(e) in rows
-                  and bool(sup[int(e)].get("incomplete_sframe_found", True))]
-            ex = rng.sample(ex, min(n, len(ex)))
+                  and _has(int(e), "incomplete_sframe_found")]
+            dapout = metric in NEEDS_OUTPUT or metric == "qa_telluric"
+            ex.sort(key=lambda e: (dapout and not _has(e, "incomplete_dap_output_found"),
+                                   e not in jobs, rank[e]))  # already-read exposures first
+            ex = ex[:n]
             picked[metric][cls] = ex
             for slot, e in enumerate(ex):
                 jobs.setdefault(e, []).append((metric, cls, slot, sup[e]))
+    log.info("diagnostics PDF: %d panels from %d exposures", sum(len(j) for j in jobs.values()), len(jobs))
+    import time
+    t0 = time.time()
     panels: Dict[Tuple, Dict[str, Any]] = {}
     args = [(cfg, rows[e], j) for e, j in jobs.items()]
     if nproc > 1:
@@ -927,6 +1027,8 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
     else:
         for a in args:
             panels.update(_work(a))
+    log.info("diagnostics PDF: data of %d exposures read in %.1f s", len(jobs), time.time() - t0)
+    t0 = time.time()
     out = Path(out) if out else Path(f"{base}_diagnostics.pdf")
     with PdfPages(out) as pdf:
         for metric, cl in picked.items():
@@ -956,8 +1058,11 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
             fig.tight_layout(rect=(0.05, 0.12, 1, 0.96))
             pdf.savefig(fig)
             plt.close(fig)
+        log.info("diagnostics PDF: %d metric pages drawn in %.1f s", len(picked), time.time() - t0)
+        t0 = time.time()
         coords = {e: (float(r.get("sci_ra", np.nan)), float(r.get("sci_dec", np.nan))) for e, r in rows.items()}
-        _fluxmap_page(pdf, qa, supl, cfg, coords=coords)
+        _fluxmap_page(pdf, qa, supl, cfg, coords=coords, nproc=nproc)
+        log.info("diagnostics PDF: fluxmap page in %.1f s", time.time() - t0)
     return out
 
 

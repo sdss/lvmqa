@@ -294,7 +294,10 @@ class ExposureContext:
         """
         if not self.has_dap_output:
             raise MissingInputError(f"DAP output file not found: {self.dap_output_file.name}")
-        import gzip
+        try:  # optional: python-isal (igzip) decompresses ~25-40% faster than zlib
+            from isal import igzip as gzip
+        except ImportError:
+            import gzip
         with self.timed("io_dap_output"):
             path = self.dap_output_file
             opener = gzip.open if path.suffix == ".gz" else open

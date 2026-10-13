@@ -13,6 +13,7 @@ dependencies = ["numpy", "astropy>=5", "plotly>=5", "openpyxl", "matplotlib>=3.3
 [project.optional-dependencies]
 hipparcos = ["astroquery"]
 multitile = ["scipy"]
+fast = ["isal"]          # faster gzip decompression of the DAP output cubes
 
 [project.scripts]
 lvmqa = "lvmqa.cli:main"

@@ -17,6 +17,7 @@ UNDEFINED  no DAP file, no overlapping neighbour (or all edges rejected -> WARNI
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,66 @@ def _payload_from_dap(path) -> dict:
     t = join(pt["id", "ra", "dec"], r, keys="id")
     return dict(ra=np.asarray(t["ra"], np.float32), dec=np.asarray(t["dec"], np.float32),
                 flux=np.asarray(t[f"flux_{LINE}"], np.float32), eflux=np.asarray(t[f"e_flux_{LINE}"], np.float32))
+
+
+# ----------------------------------------------------------------------------- Halpha map cache
+# Per-exposure Halpha maps (ra, dec, flux, eflux; ~30 KB) cached in <cache_dir>/halpha_maps/,
+# written whenever a DAP file is read for them (pipeline workers, context tiles, diagnostics PDF)
+# and validated against the size and mtime of the DAP file. Saves re-reading the DAP files for
+# the context tiles of later runs and for the fluxmap page of the diagnostics PDF.
+_MAP_KEYS = ("ra", "dec", "flux", "eflux")
+
+
+def _cache_file(cfg, expnum) -> Path:
+    return Path(cfg.cache_dir) / "halpha_maps" / f"{cfg.drp_version}_{cfg.dap_label}" / f"{int(expnum):08d}.npz"
+
+
+def save_halpha_map(cfg, expnum, payload, src) -> None:
+    """Store a Halpha map in the cache (atomic write; failures are only logged)."""
+    try:
+        st = Path(src).stat()
+        cf = _cache_file(cfg, expnum)
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cf.with_name(f".{cf.stem}.{os.getpid()}.tmp.npz")
+        np.savez(tmp, src_size=st.st_size, src_mtime=st.st_mtime,
+                 **{k: np.asarray(payload[k], np.float32) for k in _MAP_KEYS})
+        os.replace(tmp, cf)
+    except Exception as exc:  # noqa: BLE001 - the cache is optional
+        log.debug("qa_fluxmap: cannot cache Halpha map of %s: %s", expnum, exc)
+
+
+def halpha_map(cfg, tileid, mjd, expnum, path=None):
+    """Halpha map {ra, dec, flux, eflux} of an exposure: from the cache if it is up to date,
+    otherwise from the DAP file (then cached). None if the DAP file does not exist."""
+    from ..paths import dap_path
+    path = Path(path) if path is not None else Path(dap_path(cfg, int(tileid), int(mjd), int(expnum)))
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    cf = _cache_file(cfg, expnum)
+    if cf.is_file():
+        try:
+            with np.load(cf) as z:
+                if int(z["src_size"]) == st.st_size and float(z["src_mtime"]) == st.st_mtime:
+                    return {k: np.array(z[k]) for k in _MAP_KEYS}
+        except Exception:  # noqa: BLE001 - corrupt / partial cache file: re-read
+            pass
+    pl = _payload_from_dap(path)
+    save_halpha_map(cfg, expnum, pl, path)
+    return pl
+
+
+def _halpha_map_job(args):
+    """Process-pool helper: (cfg, tileid, mjd, expnum) -> (expnum, map or None)."""
+    import warnings
+    warnings.simplefilter("ignore")
+    cfg, tileid, mjd, expnum = args
+    try:
+        return int(expnum), halpha_map(cfg, tileid, mjd, expnum)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("qa_fluxmap: cannot read Halpha map of %s: %s", expnum, exc)
+        return int(expnum), None
 
 
 @register
@@ -74,9 +135,11 @@ class FluxMap(Metric):
             return None
         pt = ctx.dap_table("PT")
         npc = ctx.dap_np_columns([f"flux_{LINE}", f"e_flux_{LINE}"])
-        return dict(ra=np.asarray(pt["ra"], np.float32), dec=np.asarray(pt["dec"], np.float32),
-                    flux=np.asarray(npc[f"flux_{LINE}"], np.float32),
-                    eflux=np.asarray(npc[f"e_flux_{LINE}"], np.float32))
+        pl = dict(ra=np.asarray(pt["ra"], np.float32), dec=np.asarray(pt["dec"], np.float32),
+                  flux=np.asarray(npc[f"flux_{LINE}"], np.float32),
+                  eflux=np.asarray(npc[f"e_flux_{LINE}"], np.float32))
+        save_halpha_map(ctx.cfg, ctx.expnum, pl, ctx.dap_file)
+        return pl
 
     def compute_multi(self, payloads, cfg, drpall):
         from ..multitile.fluxmap import Node, build_edges, solve
@@ -107,7 +170,7 @@ class FluxMap(Metric):
                 if not Path(f).is_file():
                     continue
                 try:
-                    pl = _payload_from_dap(f)
+                    pl = halpha_map(cfg, int(row["tileid"]), int(row["mjd"]), int(row["expnum"]), f)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("qa_fluxmap: cannot read context DAP %s: %s", f, exc)
                     continue
