@@ -161,10 +161,17 @@ def finalize_records(records: List[Dict[str, Any]], metrics: List[Metric], cfg: 
             r["timing"][m.name] = r["timing"].get(m.name, 0.0) + dt
             if rr.note:
                 r["notes"][m.name] = rr.note
+    summarize_records(records, metrics)
+    for r in records:
+        r.pop("payloads", None)
+
+
+def summarize_records(records: List[Dict[str, Any]], metrics: List[Metric]) -> None:
+    """(Re)compute all summary metrics of every record from the component flags / values / notes."""
     summaries = [m for m in metrics if m.summary]
     for r in records:
         results = {name: MetricResult(QAFlag(f), r["values"].get(name, {}), r["notes"].get(name, ""))
-                   for name, f in r["flags"].items()}
+                   for name, f in r["flags"].items() if name not in {m.name for m in summaries}}
         for m in summaries:
             tm = time.perf_counter()
             res = m.safe_summarize(results, metrics, r["expnum"])
@@ -172,9 +179,9 @@ def finalize_records(records: List[Dict[str, Any]], metrics: List[Metric], cfg: 
             r["timing"][m.name] = time.perf_counter() - tm
             r["flags"][m.name] = int(res.flag)
             r["values"][m.name] = res.values
+            r["notes"].pop(m.name, None)
             if res.note:
                 r["notes"][m.name] = res.note
-        r.pop("payloads", None)
 
 
 def _process_in_worker(args):
@@ -271,6 +278,7 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
            existing_only: bool = False,
            nproc: int = 1,
            write: bool = True, html: bool = True, tag: Optional[str] = None,
+           pdf: bool = True, pdf_n: int = 5, pdf_seed: int = 1,
            ) -> QAResult:
     """
     Run the QA pipeline.
@@ -287,6 +295,8 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     nproc                    : number of worker processes.
     write, html              : write FITS+XLSX (and HTML report) to ``output_dir``.
     tag                      : optional suffix for output file names.
+    pdf, pdf_n, pdf_seed     : write the diagnostics PDF (<base>_diagnostics.pdf; up to pdf_n random
+                               exposures per status and metric) after the tables (needs write).
     """
     t_start = time.time()
     for spec in metric_modules or ():
@@ -344,6 +354,19 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
             base = Path(cfg.output_dir) / output_basename(cfg, tag)
             from .report import write_html
             result.files["html"] = write_html(result, Path(f"{base}.html"))
+        if pdf and len(table):
+            from .diagnostics import make_pdf
+            t_pdf = time.time()
+            try:
+                result.files["pdf"] = make_pdf(
+                    drp_version, dap_version, n=pdf_n, seed=pdf_seed, nproc=max(1, nproc), tag=tag,
+                    metric_options=cfg.metric_options, redux_dir=cfg.redux_dir,
+                    analysis_dir=cfg.analysis_dir, output_dir=cfg.output_dir,
+                    drpall_file=cfg.drpall_file, cache_dir=cfg.cache_dir,
+                    dap_n_models=cfg.dap_n_models, dap_target_snr=cfg.dap_target_snr)
+                log.info("diagnostics PDF in %.1f s", time.time() - t_pdf)
+            except Exception as exc:  # noqa: BLE001 - the tables are already written
+                log.error("diagnostics PDF failed: %s", exc, exc_info=log.isEnabledFor(logging.DEBUG))
         for k, p in result.files.items():
             log.info("wrote %s: %s", k, p)
     log.info("done in %.1f s", time.time() - t_start)

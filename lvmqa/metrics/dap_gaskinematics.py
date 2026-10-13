@@ -89,6 +89,8 @@ def _values():
          ValueSpec("sig_res_disp", "f8", "km/s", "NMAD of dispersion - neighbour median"),
          ValueSpec("frac_out_v", "f8", "", "Fraction of velocity outliers"),
          ValueSpec("frac_out_disp", "f8", "", "Fraction of dispersion outliers"),
+         ValueSpec("n_out_v", "i8", "", "Number of velocity outliers"),
+         ValueSpec("n_out_disp", "i8", "", "Number of dispersion outliers"),
          ValueSpec("max_boundary_dv", "f8", "km/s", "Largest |velocity offset| of a spectrograph vs adjacent fibers of the others"),
          ValueSpec("max_boundary_ddisp", "f8", "km/s", "Largest |dispersion offset| of a spectrograph vs the others"),
          ValueSpec("worst_spec", "i8", "", "Spectrograph with the largest boundary offset")]
@@ -258,7 +260,8 @@ class GasKinematics(Metric):
                 ov = np.abs(rv[fin]) > max(p["out_nsig"] * sv, p["out_floor"])
                 od = np.abs(rd[fin]) > max(p["out_nsig"] * sd, p["out_floor"])
             fo_v, fo_d = float(ov.mean()) if ov.size else np.nan, float(od.mean()) if od.size else np.nan
-            vals.update(sig_res_v=sv, sig_res_disp=sd, frac_out_v=fo_v, frac_out_disp=fo_d)
+            vals.update(sig_res_v=sv, sig_res_disp=sd, frac_out_v=fo_v, frac_out_disp=fo_d,
+                        n_out_v=int(ov.sum()), n_out_disp=int(od.sum()))
             fo = np.nanmax([fo_v, fo_d])
             if max(ov.sum(), od.sum()) < p["min_outliers"]:
                 fo = 0.0

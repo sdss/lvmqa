@@ -1,15 +1,21 @@
 """
-Diagnostic PDF for the spectral QA metrics (development / inspection tool, separate from the
-pipeline run).
+Diagnostics of an existing QA run.
 
-    python -m lvmqa.diagnostics DRPVER [DAPVER] [--n 5] [--seed 1] [-j 3] [path options]
+1) Diagnostic PDF (make_pdf): for every metric that analyses spectra, up to ``n`` random exposures
+   per status (MAJOR ISSUE, WARNING, GOOD) with their SFrame / DAP / DAP-output data and models in
+   the relevant wavelength range (one page per metric); last page: Halpha maps of the tiles (DAP
+   NP fluxes) with the qa_fluxmap results. Written automatically at the end of every pipeline run
+   (``python -m lvmqa ...``; --no-pdf to skip).
 
-Reads the pipeline outputs (lvmqa-<drp>[-<dap>].fits and _supl.fits) from the output folder,
-picks for every metric that analyses spectra up to ``n`` random exposures per status
-(MAJOR ISSUE, WARNING, GOOD), re-reads their SFrame / DAP / DAP-output data and plots the
-relevant observations and models in the relevant wavelength range: one page per metric
-(rows = status, columns = examples). The last page shows the Halpha maps of the tiles
-(DAP NP fluxes) with the qa_fluxmap results.
+2) CLI = re-derivation of the flags from the stored measurements (no metric is recomputed):
+
+    python -m lvmqa.diagnostics DRPVER [DAPVER] [--tag T] [--output-dir D] [--set METRIC.PARAM=VALUE ...]
+                                [--pdf [--n 5] [--seed 1] [-j 3]] [--check] [--list-params]
+
+   reads <base>.fits / <base>_supl.fits, re-classifies with the current thresholds (+ --set),
+   recomputes summaries, qa_overall, qa_bitmask, and writes <base>_recalculated.{fits,xlsx},
+   _supl.{fits,xlsx}, .html and _changes.csv. The PDF (which re-reads the data of the plotted
+   exposures) is regenerated only with --pdf. Same as ``python -m lvmqa.recalc``.
 """
 
 from __future__ import annotations
@@ -192,7 +198,7 @@ def _ex_relflux(ctx, r, cls, key, metric):
     extrapolated to the overlap centre (the metric fits each fiber; shown here for the stack)."""
     from .metrics import drp_relflux as rf
     from .registry import available_metrics
-    pr = available_metrics()[metric]().params
+    pr = _minst(metric, ctx.cfg).params
     ov, blue, red = pr["overlap"], pr["blue_side"], pr["red_side"]
     res = rf.measure_steps(ctx, pr)
     w = res["w"]
@@ -210,6 +216,7 @@ def _ex_relflux(ctx, r, cls, key, metric):
                ylabel="median normalised flux (src: FLUX of bright fibers; obs: FLUX+SKY)")
     p["curves"].append((w, np.where(~lm, stack, np.nan), "unmasked pixels", dict(color="k", lw=0.6)))
     p["curves"].append((w, np.where(lm, stack, np.nan), "masked (lines, tellurics)", dict(color="0.78", lw=0.4)))
+    fits_y = []
     for side, col, lab in ((blue, "#2a78d6", "blue side"), (red, "#d03b3b", "red side")):
         msk = (w >= side[0]) & (w <= side[1]) & ~lm
         xb, yb = rf._binned(w, stack[None, :], msk, 10.0)
@@ -218,8 +225,15 @@ def _ex_relflux(ctx, r, cls, key, metric):
             c = np.polyfit(xb - x0, yb, 1)
             p["curves"].append((xb, yb, f"{lab}: 10-A bin medians", dict(color=col, ls="none", marker="o", ms=2.5)))
             xx = np.array([min(xb.min(), x0), max(xb.max(), x0)])
-            p["curves"].append((xx, np.polyval(c, xx - x0), f"{lab} fit", dict(color=col, lw=1.4)))
+            yy = np.polyval(c, xx - x0)
+            p["curves"].append((xx, yy, f"{lab} fit", dict(color=col, lw=1.4)))
+            fits_y += list(yy) + list(yb)
     p["spans"] += [tuple(ov), (blue[0], blue[1], "#cfe0f5"), (red[0], red[1], "#f6d5d2")]
+    # common y range 0.8-1.2, extended only if the fitted lines / bin medians fall outside
+    lo, hi = 0.8, 1.2
+    if fits_y:
+        lo, hi = min(lo, np.nanmin(fits_y) - 0.02), max(hi, np.nanmax(fits_y) + 0.02)
+    p["ylim"] = (lo, hi)
     p["vlines"].append(x0)
     return p
 
@@ -325,7 +339,7 @@ def ex_telluric(ctx, r, cls):
             if sel.size:
                 wd, pl = ctx.dap_output(f"dg_tell_{b}")
                 from .registry import available_metrics
-                dm = available_metrics()["qa_telluric"]().params["dap_model"]
+                dm = _minst("qa_telluric", ctx.cfg).params["dap_model"]
                 data = pl[5][sel].astype(float)
                 model = pl[1][sel].astype(float) if dm == "stellar" else pl[2][sel].astype(float) - pl[6][sel]
                 L = line(wd, model)
@@ -540,7 +554,7 @@ def ex_lineratios(ctx, r, cls):
     from .metrics.gen_lineratios import BALMER, DOUBLETS
     from .registry import available_metrics
     from .utils.extinction import ebv_from_balmer, k_lambda
-    m = available_metrics()["qa_lineratios"]()
+    m = _minst("qa_lineratios", ctx.cfg)
     pr = m.params
     fl = m._fluxes(ctx)
     k9069, k9531 = k_lambda([9069.0, 9531.1], pr["rv"], pr["extinction_law"])
@@ -590,6 +604,12 @@ NEEDS_OUTPUT = {"qa_fit_consistency", "qa_dap_pmfit", "qa_dap_npfluxes", "qa_abs
 
 
 # ----------------------------------------------------------------------------- worker
+def _minst(metric, cfg):
+    """Metric instance with the parameter overrides of the run (cfg.metric_options)."""
+    from .registry import available_metrics
+    return available_metrics()[metric](**(getattr(cfg, "metric_options", None) or {}).get(metric, {}))
+
+
 def _work(args):
     warnings.simplefilter("ignore")
     cfg, row, jobs = args
@@ -627,7 +647,9 @@ def _draw(ax, p, cls):
         a, b = sp_[0], sp_[1]
         ax.axvspan(a, b, color=sp_[2] if len(sp_) > 2 else CCOL[cls], alpha=0.25 if len(sp_) > 2 else 0.10, lw=0)
     ys = np.concatenate(ys) if ys else np.zeros(0)
-    if ys.size > 10 and p.get("robust_ylim", True):
+    if p.get("ylim"):
+        ax.set_ylim(*p["ylim"])
+    elif ys.size > 10 and p.get("robust_ylim", True):
         lo, hi = np.percentile(ys, [0.5, 99.5])
         if p["hlines"]:
             lo, hi = min(lo, min(p["hlines"])), max(hi, max(p["hlines"]))
@@ -685,30 +707,106 @@ def _clusters(ra, dec, link=2.0):
     return sorted(groups, key=lambda g: -len(g))
 
 
-def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6):
-    """Halpha maps of the tiles, one panel per sky region (tiles within 2 deg), max_panels largest."""
+def _asinh_norm(linear_width, vmin, vmax):
+    """asinh colour stretch, clipped to [vmin, vmax]: matplotlib's AsinhNorm (>= 3.6) or an
+    equivalent Normalize subclass for older matplotlib versions."""
+    try:
+        from matplotlib.colors import AsinhNorm
+        return AsinhNorm(linear_width=linear_width, vmin=vmin, vmax=vmax, clip=True)
+    except ImportError:
+        return _AsinhNormCompat(linear_width, vmin, vmax)
+
+
+def _make_asinh_compat():
+    from matplotlib.colors import Normalize
+
+    class AsinhNormCompat(Normalize):
+        """y = asinh(x / a), linearly rescaled to [0, 1] between vmin and vmax (values clipped)."""
+
+        def __init__(self, linear_width, vmin, vmax):
+            super().__init__(vmin=vmin, vmax=vmax, clip=True)
+            self.linear_width = float(linear_width)
+
+        def _f(self, x):
+            return np.arcsinh(np.asarray(x, dtype=float) / self.linear_width)
+
+        def __call__(self, value, clip=None):
+            val, is_scalar = self.process_value(value)
+            data = np.clip(np.ma.getdata(val).astype(float), self.vmin, self.vmax)
+            lo, hi = self._f(self.vmin), self._f(self.vmax)
+            res = (self._f(data) - lo) / (hi - lo if hi > lo else 1.0)
+            res = np.ma.array(res, mask=np.ma.getmaskarray(val) | ~np.isfinite(res))
+            return res[0] if is_scalar else res
+
+        def inverse(self, value):
+            lo, hi = self._f(self.vmin), self._f(self.vmax)
+            return self.linear_width * np.sinh(lo + np.asarray(value, dtype=float) * (hi - lo))
+
+    return AsinhNormCompat
+
+
+def _AsinhNormCompat(linear_width, vmin, vmax):  # noqa: N802 - factory (matplotlib imported lazily)
+    return _make_asinh_compat()(linear_width, vmin, vmax)
+
+
+def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None):
+    """Halpha maps of the tiles, one panel per sky region (tiles within 2 deg), max_panels largest.
+
+    Regions are found from the tile centres (``coords`` = {expnum: (ra, dec)} from drpall; DAP
+    fiber positions otherwise); DAP maps are read only for the exposures that are drawn (first
+    exposure of each pointing in the shown regions), so the page stays cheap for large runs."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from .metrics.dap_fluxmap import _payload_from_dap
     from .paths import dap_path
-    pts = []
+    coords = coords or {}
+    cand, files = [], []
     for row in qa:
         f = dap_path(cfg, int(row["tileid"]), int(row["mjd"]), int(row["expnum"]))
-        if not Path(f).is_file():
-            continue
-        pl = _payload_from_dap(f)
-        lf = np.asarray(pl["flux"], float)
-        pts.append((row, pl, lf))
-    if not pts:
+        if Path(f).is_file():
+            cand.append(row)
+            files.append(f)
+    if not cand:
         return
-    from matplotlib.colors import AsinhNorm
-    allv = np.concatenate([lf[np.isfinite(lf)] for _, _, lf in pts])
-    lo, hi = np.percentile(allv, [1, 99.5])
-    # asinh stretch: linear around the faint level (20th percentile), logarithmic for bright regions
-    norm = AsinhNorm(linear_width=max(np.percentile(allv, 20), 1e-3 * hi), vmin=min(lo, 0.0), vmax=hi)
-    ra0 = np.array([np.nanmedian(p[1]["ra"]) for p in pts])
-    de0 = np.array([np.nanmedian(p[1]["dec"]) for p in pts])
-    groups = _clusters(ra0, de0)
+
+    class _Maps(dict):  # lazily read DAP Halpha maps: pts[i] = (row, payload, flux)
+        def __missing__(self, i):
+            pl = _payload_from_dap(files[i])
+            v = (cand[i], pl, np.asarray(pl["flux"], float))
+            self[i] = v
+            return v
+
+    pts = _Maps()
+    ra0 = np.full(len(cand), np.nan)
+    de0 = np.full(len(cand), np.nan)
+    for i, row in enumerate(cand):
+        c = coords.get(int(row["expnum"]))
+        if c is not None and np.all(np.isfinite(c)):
+            ra0[i], de0[i] = c
+        else:
+            ra0[i], de0[i] = np.nanmedian(pts[i][1]["ra"]), np.nanmedian(pts[i][1]["dec"])
+    good = np.isfinite(ra0) & np.isfinite(de0)
+    if not good.any():
+        return
+    def _norm(idx):
+        """Colour scale of one field (panel): pooled fluxes of its tiles, excluding tiles with absurd
+        fluxes (per-tile 99th percentile > 20 x the median of the per-tile values, e.g. a broken
+        spectrograph). vmax = 99.2th percentile (faint structures visible, bright cores not overly
+        saturated); vmin = 0 (negative noise fluxes clipped to the darkest colour); asinh stretch
+        linear around the faint level (20th percentile of the positive fluxes)."""
+        fin = [pts[i][2][np.isfinite(pts[i][2])] for i in idx]
+        p99 = np.array([np.percentile(x, 99) if x.size else np.nan for x in fin])
+        ref = np.nanmedian(p99) if np.isfinite(p99).any() else np.nan
+        keep = [x for x, q in zip(fin, p99) if np.isfinite(q) and q < 20 * ref] or fin
+        allv = np.concatenate(keep) if keep else np.array([1.0])
+        hi = np.percentile(allv, 99.2) if allv.size else 1.0
+        hi = hi if np.isfinite(hi) and hi > 0 else 1.0
+        pos = allv[allv > 0]
+        lw = np.percentile(pos, 20) if pos.size else 1e-3 * hi
+        return _asinh_norm(max(lw, 1e-3 * hi), 0.0, hi)
+
+    gidx = np.where(good)[0]
+    groups = [gidx[g] for g in _clusters(ra0[good], de0[good])]
     shown = groups[:max_panels]
     nc = 1 if len(shown) == 1 else (2 if len(shown) <= 4 else 3)
     nr = int(np.ceil(len(shown) / nc))
@@ -717,6 +815,7 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6):
     sc = None
     for ax, g in zip(axes.flat, shown):
         first = [g[sub[0]] for sub in _clusters(ra0[g], de0[g], link=0.05)]
+        norm = _norm(first)
         for i in first:
             row, pl, lf = pts[i]
             sc = ax.scatter(pl["ra"], pl["dec"], c=lf, s=3 if len(first) > 3 else 12, cmap="magma",
@@ -727,7 +826,7 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6):
             idx = g[sub]
             lines, worst = [], ""
             for i in idx:
-                row = pts[i][0]
+                row = cand[i]
                 e = int(row["expnum"])
                 st = str(row["qa_fluxmap"]) if "qa_fluxmap" in qa.colnames else ""
                 sv = _f(by[e]["fluxmap_s_dex"]) if e in by and "fluxmap_s_dex" in supl.colnames else np.nan
@@ -741,6 +840,8 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6):
             ax.text(np.median(ra0[idx]), np.median(de0[idx]), "\n".join(lines), ha="center", va="center",
                     fontsize=5.5 if len(idx) < 6 else 4.5, color="k", family="monospace",
                     bbox=dict(facecolor=CCOL.get(worst, "0.8"), alpha=0.5, lw=0, pad=1.2))
+        cb = fig.colorbar(sc, ax=ax, shrink=0.7, pad=0.02)
+        cb.ax.tick_params(labelsize=6)
         ax.invert_xaxis()
         ax.set_aspect(1.0 / np.cos(np.deg2rad(np.median(de0[g]))), adjustable="datalim")
         ax.set_xlabel("RA [deg]", fontsize=7)
@@ -750,11 +851,12 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6):
                      fontsize=7)
     for ax in list(axes.flat)[len(shown):]:
         ax.axis("off")
-    axes.flat[0].legend(handles=[Line2D([], [], color=CCOL[c], lw=2, label=c) for c in CLASSES] +
-                        [Line2D([], [], color="0.5", lw=2, label="UNDEFINED")], loc="best", fontsize=6,
-                        title="outline = qa_fluxmap (worst of repeated pointings); label = expnum, s [dex]; map = first exposure",
-                        title_fontsize=6)
-    fig.colorbar(sc, ax=axes.ravel().tolist(), label="F(Halpha) [1e-16 erg/s/cm2] (DAP NP; asinh stretch)", shrink=0.8)
+    fig.legend(handles=[Line2D([], [], color=CCOL[c], lw=2, label=c) for c in CLASSES] +
+               [Line2D([], [], color="0.5", lw=2, label="UNDEFINED")], loc="lower center", ncol=4, fontsize=7,
+               title="outline = qa_fluxmap (worst of repeated pointings); label = expnum, s [dex]; map = first "
+                     "exposure; colour = F(Halpha) [1e-16 erg/s/cm2] (DAP NP; asinh stretch, own scale per panel)",
+               title_fontsize=7, frameon=False)
+    fig.subplots_adjust(bottom=0.13)
     extra = f" ({len(groups) - len(shown)} more regions not shown)" if len(groups) > len(shown) else ""
     fig.suptitle("qa_fluxmap: Halpha maps of the tiles (DAP NP), fitted flux-scale offsets s and status" + extra,
                  fontsize=10)
@@ -767,7 +869,7 @@ def _criteria_text(metric, cfg, width=190) -> str:
     import textwrap
     from .registry import available_metrics
     try:
-        crit = available_metrics()[metric]().criteria
+        crit = _minst(metric, cfg).criteria
     except Exception:  # noqa: BLE001
         return ""
     lines = []
@@ -779,15 +881,23 @@ def _criteria_text(metric, cfg, width=190) -> str:
     return "\n".join(lines)
 
 
-def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=None, **paths) -> Path:
+def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=None, suffix="",
+             metric_options=None, **paths) -> Path:
+    """Diagnostics PDF from the written tables <base><suffix>.fits / _supl.fits (re-reads the data of
+    the plotted exposures). Called at the end of every pipeline run, and by the recalculation
+    (python -m lvmqa.diagnostics ... --pdf). ``paths``: PipelineConfig keywords (redux_dir, ...)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
     from astropy.table import Table
 
-    cfg = PipelineConfig(drp_version=drp_version, dap_version=dap_version, **paths)
-    base = Path(cfg.output_dir) / output_basename(cfg, tag)
+    paths = {k: v for k, v in paths.items() if v is not None}
+    cfg = PipelineConfig(drp_version=drp_version, dap_version=dap_version,
+                         metric_options=dict(metric_options or {}), **paths)
+    base = Path(cfg.output_dir) / output_basename(cfg, tag, suffix)
+    if not Path(f"{base}.fits").is_file():
+        raise FileNotFoundError(f"{base}.fits not found (check --output-dir / --tag / --suffix)")
     qa = Table.read(f"{base}.fits", hdu="QA")
     supl = Table.read(f"{base}_supl.fits", hdu="SUPL")
     from .pipeline import load_drpall, select_exposures, _row_to_dict
@@ -839,32 +949,24 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
             fig.text(0.05, 0.005, _criteria_text(metric, cfg), fontsize=6.3, va="bottom", ha="left",
                      family="monospace", color="0.2")
             if ylab:
-                fig.supylabel(ylab, fontsize=9, x=0.006)
+                if hasattr(fig, "supylabel"):  # matplotlib >= 3.4
+                    fig.supylabel(ylab, fontsize=9, x=0.006)
+                else:
+                    fig.text(0.006, 0.5, ylab, rotation=90, va="center", ha="left", fontsize=9)
             fig.tight_layout(rect=(0.05, 0.12, 1, 0.96))
             pdf.savefig(fig)
             plt.close(fig)
-        _fluxmap_page(pdf, qa, supl, cfg)
+        coords = {e: (float(r.get("sci_ra", np.nan)), float(r.get("sci_dec", np.nan))) for e, r in rows.items()}
+        _fluxmap_page(pdf, qa, supl, cfg, coords=coords)
     return out
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("drp_version")
-    ap.add_argument("dap_version", nargs="?", default=None)
-    ap.add_argument("--n", type=int, default=5)
-    ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("-j", "--nproc", type=int, default=3)
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--tag", default=None)
-    for k in ("redux_dir", "analysis_dir", "output_dir", "drpall_file", "cache_dir"):
-        ap.add_argument(f"--{k.replace('_', '-')}", dest=k, default=None)
-    a = ap.parse_args(argv)
-    paths = {k: getattr(a, k) for k in ("redux_dir", "analysis_dir", "output_dir", "drpall_file", "cache_dir")
-             if getattr(a, k)}
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    p = make_pdf(a.drp_version, a.dap_version, n=a.n, seed=a.seed, nproc=a.nproc, out=a.out, tag=a.tag, **paths)
-    print(p)
+    """CLI: ``python -m lvmqa.diagnostics`` = re-derive the QA flags from the stored measurements
+    (lvmqa.recalc; writes <base>_recalculated.*), PDF only with --pdf."""
+    from .recalc import main as recalc_main
+    return recalc_main(argv, prog="python -m lvmqa.diagnostics")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

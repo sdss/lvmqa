@@ -72,6 +72,8 @@ def _values():
             v.append(ValueSpec(f"off_sp{s}_{ch}", "f8", "percent",
                                f"D for spectrograph {s}, {ch} channel: median over lines of "
                                f"median flux / median of the three spectrographs - 1"))
+            v.append(ValueSpec(f"e_off_sp{s}_{ch}", "f8", "percent",
+                               f"Uncertainty used for the significance of off_sp{s}_{ch} (typical of the channel)"))
     v += [ValueSpec("n_blocks", "i8", "", "Fiber blocks evaluated (diagnostic)"),
           ValueSpec("max_block_offset", "f8", "", "Largest block offset (median over lines, units of fiber scatter)"),
           ValueSpec("max_block_rel", "f8", "percent", "Largest block offset relative to the reference (median over lines)"),
@@ -219,6 +221,7 @@ class FlatField(Metric):
             same = [k for k in D if k[1] == key[1]]
             Derr[key] = max(float(np.median([e_med[k] for k in same])),
                             float(np.median([e_scat[k] for k in same])))
+            vals[f"e_off_sp{key[0]}_{key[1]}"] = 100.0 * Derr[key]
         if block_dev:
             bmed = {b: float(np.median(v)) for b, v in block_dev.items()}
             wb = max(bmed, key=bmed.get)

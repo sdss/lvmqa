@@ -1,7 +1,8 @@
 """
 Re-derive the QA flags from the stored measurements (no SFrame / DAP access).
 
-    python -m lvmqa.recalc DRPVER [DAPVER] [--tag T] [--set METRIC.PARAM=VALUE ...] [--pdf] [--check]
+    python -m lvmqa.diagnostics DRPVER [DAPVER] [--tag T] [--set METRIC.PARAM=VALUE ...] [--pdf] [--check]
+    python -m lvmqa.recalc ...       (same)
     from lvmqa.recalc import recalculate
 
 Reads <base>.fits (flags) and <base>_supl.fits (measured values, notes), re-applies the
@@ -612,8 +613,13 @@ def _parse_notes(s: str, names) -> Dict[str, str]:
 def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Optional[str] = None,
                 metric_options: Optional[Dict[str, Dict[str, Any]]] = None, output_dir=None,
                 write: bool = True, html: bool = True, pdf: bool = False, suffix: str = "_recalculated",
-                check: bool = False, **paths):
-    """Re-derive all flags from the stored measurements; returns (QAResult, changes table)."""
+                check: bool = False, pdf_n: int = 5, pdf_seed: int = 1, nproc: int = 3, **paths):
+    """Re-derive all flags from the stored measurements (no SFrame / DAP access); returns
+    (QAResult, changes table). Writes <base><suffix>.*; the diagnostics PDF (re-reads the data of
+    the plotted exposures) only if ``pdf``."""
+    if write and not check and not suffix:
+        raise ValueError("suffix must not be empty (the original QA files would be overwritten)")
+    paths = {k: v for k, v in paths.items() if v is not None}
     from .output import output_basename, write_outputs
     from .pipeline import ID_COLUMNS, QAResult, build_table, summarize_records
     from .registry import build_metrics
@@ -688,27 +694,34 @@ def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Opt
         result.files["changes"] = Path(f"{out}_changes.csv")
         if pdf:
             from .diagnostics import make_pdf
-            result.files["pdf"] = make_pdf(drp_version, dap_version, tag=tag, suffix=suffix, **paths,
-                                           **({"output_dir": output_dir} if output_dir else {}))
+            result.files["pdf"] = make_pdf(drp_version, dap_version, n=pdf_n, seed=pdf_seed, nproc=nproc,
+                                           tag=tag, suffix=suffix, metric_options=cfg.metric_options,
+                                           output_dir=cfg.output_dir, **paths)
     return result, ch
 
 
-def main(argv=None):
+def main(argv=None, prog=None):
     import ast
-    ap = argparse.ArgumentParser(description="Re-derive the QA flags from stored measurements "
-                                             "(writes <base>_recalculated.*)")
+    ap = argparse.ArgumentParser(prog=prog, description="Re-derive the QA flags from the measurements stored "
+                                 "in <base>_supl.fits (no metric is recomputed) and write <base>_recalculated.* "
+                                 "(FITS, XLSX, HTML, changes CSV). The diagnostics PDF only with --pdf.")
     ap.add_argument("drp_version")
     ap.add_argument("dap_version", nargs="?", default=None)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--set", action="append", default=[], metavar="METRIC.PARAM=VALUE")
     ap.add_argument("--suffix", default="_recalculated")
     ap.add_argument("--no-html", action="store_true")
-    ap.add_argument("--pdf", action="store_true", help="also re-make the diagnostics PDF (re-reads the data)")
+    ap.add_argument("--pdf", action="store_true",
+                    help="also regenerate the diagnostics PDF for the recalculated flags (re-reads the data)")
+    ap.add_argument("--n", type=int, default=5, help="PDF: random exposures per status and metric")
+    ap.add_argument("--seed", type=int, default=1, help="PDF: random seed")
+    ap.add_argument("-j", "--nproc", type=int, default=3, help="PDF: worker processes")
     ap.add_argument("--check", action="store_true",
                     help="consistency test: re-classify with unchanged parameters, report differences, write nothing")
     ap.add_argument("--list-params", action="store_true", help="list the parameters usable for recalculation")
-    for k in ("redux_dir", "analysis_dir", "output_dir", "drpall_file"):
+    for k in ("redux_dir", "analysis_dir", "output_dir", "drpall_file", "cache_dir"):
         ap.add_argument(f"--{k.replace('_', '-')}", dest=k, default=None)
+    ap.add_argument("--drpall", dest="drpall_file", default=None, help="alias of --drpall-file")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     if a.list_params:
@@ -727,9 +740,10 @@ def main(argv=None):
             log.warning("%s.%s is not a classification parameter: it has no effect without a full run",
                         mname, par)
         opts.setdefault(mname, {})[par] = val
-    paths = {k: getattr(a, k) for k in ("redux_dir", "analysis_dir", "drpall_file") if getattr(a, k)}
+    paths = {k: getattr(a, k) for k in ("redux_dir", "analysis_dir", "drpall_file", "cache_dir") if getattr(a, k)}
     res, ch = recalculate(a.drp_version, a.dap_version, tag=a.tag, metric_options=opts, output_dir=a.output_dir,
-                          html=not a.no_html, pdf=a.pdf, suffix=a.suffix, check=a.check, **paths)
+                          html=not a.no_html, pdf=a.pdf, suffix=a.suffix, check=a.check,
+                          pdf_n=a.n, pdf_seed=a.seed, nproc=a.nproc, **paths)
     from collections import Counter
     print(f"{len(ch)} flag change(s): " + ", ".join(f"{k}: {n}" for k, n in Counter(ch["metric"]).most_common()))
     if a.check:

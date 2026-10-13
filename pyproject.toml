@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Quality-assurance pipeline for SDSS-V LVM data (SFrames, DAP, drpall)"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["numpy", "astropy>=5", "plotly>=5", "openpyxl"]
+dependencies = ["numpy", "astropy>=5", "plotly>=5", "openpyxl", "matplotlib>=3.3"]
 
 [project.optional-dependencies]
 hipparcos = ["astroquery"]

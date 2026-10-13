@@ -79,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     og = ap.add_argument_group("output / execution")
     og.add_argument("--tag", help="suffix for output file names")
     og.add_argument("--no-html", action="store_true", help="do not write the HTML report")
+    og.add_argument("--no-pdf", action="store_true", help="do not write the diagnostics PDF")
+    og.add_argument("--pdf-n", type=int, default=5, metavar="N",
+                    help="diagnostics PDF: random exposures per status and metric (default 5)")
+    og.add_argument("--pdf-seed", type=int, default=1, help="diagnostics PDF: random seed (default 1)")
     og.add_argument("--no-write", action="store_true", help="do not write any output")
     og.add_argument("-j", "--nproc", type=int, default=1, help="worker processes (default 1)")
     og.add_argument("-v", "--verbose", action="count", default=0)
@@ -119,6 +123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dap_n_models=args.dap_n_models, dap_target_snr=args.dap_target_snr,
         existing_only=args.existing_only, nproc=args.nproc,
         write=not args.no_write, html=not args.no_html, tag=args.tag,
+        pdf=not args.no_pdf, pdf_n=args.pdf_n, pdf_seed=args.pdf_seed,
     )
     t = res.table
     if len(t):

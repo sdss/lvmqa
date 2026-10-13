@@ -53,6 +53,7 @@ def _values():
         v.append(ValueSpec(f"{t}_flag", "U11", "", f"Flag of the {t} ratio sub-test"))
         v.append(ValueSpec(f"{t}_n", "i8", "", f"{t}: fibers used"))
         v.append(ValueSpec(f"{t}_dev", "f8", "percent", f"{t}: median(R_obs/R_expected) - 1"))
+        v.append(ValueSpec(f"{t}_e_dev", "f8", "percent", f"{t}: uncertainty of the median deviation"))
     v.append(ValueSpec("siii_expratio", "f8", "", "Median expected (reddened) [SIII] 9531/9069"))
     v.append(ValueSpec("av_med", "f8", "mag", "Median A_V from Halpha/Hbeta of fibers in the siii test"))
     for t in BALMER:
@@ -124,6 +125,19 @@ class LineRatios(Metric):
                 ok &= np.isfinite(f) & np.isfinite(e) & (e > 0) & (f / e > self.params["min_snr"])
         return ok
 
+    def doublet_classify(self, test, n, dev_pct, err_pct):
+        """Flag of a doublet sub-test from n, deviation and its error (percent)."""
+        p = self.params
+        if not (n >= p["min_fibers"]) or not np.isfinite(dev_pct):
+            return QAFlag.UNDEFINED
+        a = abs(dev_pct)
+        signif = a > p["nsig_median"] * err_pct
+        if signif and a > p[f"major_dev_{test}"]:
+            return QAFlag.MAJOR
+        if signif and a > p[f"warn_dev_{test}"]:
+            return QAFlag.WARNING
+        return QAFlag.GOOD
+
     def _doublet_flag(self, test, y):
         """y = R_obs / R_expected per fiber -> (flag, n, deviation in percent)."""
         p = self.params
@@ -132,6 +146,7 @@ class LineRatios(Metric):
             return QAFlag.UNDEFINED, n, np.nan
         dev = float(np.median(y) - 1.0)
         err = 1.2533 * _nmad(y) / np.sqrt(n)
+        self._last_err = 100 * err
         a = abs(dev) * 100.0
         signif = abs(dev) > p["nsig_median"] * err
         if signif and a > p[f"major_dev_{test}"]:
@@ -171,7 +186,9 @@ class LineRatios(Metric):
                 if ok.sum():
                     vals["siii_expratio"] = float(np.median(expected))
                     vals["av_med"] = float(np.median(p["rv"] * ebv))
+            self._last_err = np.nan
             sub[test], vals[f"{test}_n"], vals[f"{test}_dev"] = self._doublet_flag(test, r / expected)
+            vals[f"{test}_e_dev"] = self._last_err
 
         for test, (num, den) in BALMER.items():
             ok = self._good(fl, [num, den])

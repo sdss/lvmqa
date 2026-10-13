@@ -40,9 +40,10 @@ XLSX_FILLS = {"GOOD": "FF92D050", "WARNING": "FFFFC000", "MAJOR ISSUE": "FFFF000
               "UNDEFINED": "FFBFBFBF"}
 
 
-def output_basename(cfg: PipelineConfig, tag: Optional[str] = None) -> str:
+def output_basename(cfg: PipelineConfig, tag: Optional[str] = None, suffix: str = "") -> str:
+    """lvmqa-<drp>[-<dap>][-<tag>][<suffix>], e.g. suffix '_recalculated'."""
     base = f"lvmqa-{cfg.drp_version}" + (f"-{cfg.dap_version}" if cfg.dap_version else "")
-    return f"{base}-{tag}" if tag else base
+    return (f"{base}-{tag}" if tag else base) + (suffix or "")
 
 
 def to_ascii(value) -> str:
@@ -280,9 +281,9 @@ def write_xlsx_supl(result, path: Path) -> Path:
     ])
 
 
-def write_outputs(result, tag: Optional[str] = None) -> Dict[str, Path]:
+def write_outputs(result, tag: Optional[str] = None, suffix: str = "") -> Dict[str, Path]:
     # NB: no Path.with_suffix() - the DAP version contains dots
-    base = Path(result.config.output_dir) / output_basename(result.config, tag)
+    base = Path(result.config.output_dir) / output_basename(result.config, tag, suffix)
     base.parent.mkdir(parents=True, exist_ok=True)
     return {
         "fits": write_fits_main(result, Path(f"{base}.fits")),
