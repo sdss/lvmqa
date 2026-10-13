@@ -6,7 +6,7 @@ Two groups of files are written, ``<base> = lvmqa-<drpver>-<dapver>[-tag]``:
 <base>.fits / <base>.xlsx  -- final QA information (DR20-like)
     QA      : expnum, tileid, mjd, object, qa_bitmask, qa_<metric> (GOOD / WARNING /
               MAJOR ISSUE / UNDEFINED) for every metric
-    DESC    : one row per metric: group, slot, bits, description, criteria, parameters
+    DESC    : one row per metric: role, slot, bits, description, criteria, parameters
     (xlsx: sheets "QA" with DR20 cell colours, and "DESC")
 
 <base>_supl.fits / <base>_supl.xlsx  -- supplementary measurements
@@ -59,7 +59,11 @@ def to_ascii(value) -> str:
 def main_table(result) -> Table:
     t = result.table
     cols = [c for c in MAIN_ID_COLUMNS if c in t.colnames] + ["qa_bitmask"]
-    cols += [m.name for m in result.metrics]
+    cols += [m.name for m in result.metrics if not m.status]
+    # tile status (information): boolean columns, e.g. status_auroral
+    for m in result.metrics:
+        if m.status:
+            cols += [m.column(v.name) for v in m.values if v.dtype == "bool"]
     return t[cols]
 
 
@@ -81,7 +85,7 @@ def build_desc_table(result) -> Table:
     rows = []
     for m in result.metrics:
         rows.append(dict(
-            Metric=m.name, Group=m.group, Role=m.role,
+            Metric=m.name, Role=m.role,
             Slot=m.slot if m.slot is not None else -1,
             Bits=f"{2 * m.slot}-{2 * m.slot + 1}" if m.slot is not None else "- (not in bitmask)",
             Title=m.title, Description=m.description,
@@ -169,10 +173,17 @@ def _bintable(table: Table, name: str) -> fits.BinTableHDU:
     return hdu
 
 
+def _writeto(hdul: fits.HDUList, path: Path) -> None:
+    """Write (overwrite) a FITS file by truncating it in place: works also in folders where
+    files may be created/modified but not deleted (astropy's overwrite=True unlinks first)."""
+    with open(path, "wb") as fh:
+        hdul.writeto(fh)
+
+
 def write_fits_main(result, path: Path) -> Path:
     hdul = fits.HDUList([_primary(result, "QA"), _bintable(main_table(result), "QA"),
                          _bintable(build_desc_table(result), "DESC")])
-    hdul.writeto(path, overwrite=True)
+    _writeto(hdul, path)
     return Path(path)
 
 
@@ -180,7 +191,7 @@ def write_fits_supl(result, path: Path) -> Path:
     cols = supl_columns(result)
     hdul = fits.HDUList([_primary(result, "SUPL"), _bintable(supl_table(result), "SUPL"),
                          _bintable(build_columns_table(result, cols), "COLUMNS")])
-    hdul.writeto(path, overwrite=True)
+    _writeto(hdul, path)
     return Path(path)
 
 
@@ -256,7 +267,7 @@ def _write_xlsx(path: Path, sheets) -> Path:
 def write_xlsx_main(result, path: Path) -> Path:
     desc = build_desc_table(result)
     return _write_xlsx(path, [
-        ("QA", main_table(result), dict(status_cols=[m.name for m in result.metrics])),
+        ("QA", main_table(result), dict(status_cols=[m.name for m in result.metrics if not m.status])),
         ("DESC", desc, dict(max_width=60)),
     ])
 

@@ -1,7 +1,8 @@
 """
 qa_incomplete - completeness of the data products of one exposure.
 
-Checks that the SFrame and DAP files exist, and how many science-IFU fibers carry no
+Checks that the SFrame and DAP files (table *.dap.fits.gz and model RSS *.output.fits.gz)
+exist, and how many science-IFU fibers carry no
 usable data (NaN / ivar<=0 / masked) in each spectrograph channel (b, r, z) and for
 each spectrograph.
 """
@@ -21,10 +22,11 @@ class IncompleteData(Metric):
     slot = 1
     group = GROUP_GEN
     title = "Incomplete data"
-    description = ("Completeness of the exposure: presence of SFrame and DAP files, and "
+    description = ("Completeness of the exposure: presence of SFrame and DAP files (tables and "
+                   "model RSS 'output'), and "
                    "fraction of science fibers without usable data per channel and "
                    "spectrograph")
-    requires = ("sframe_data", "dap")
+    requires = ("sframe_data", "dap", "dap_output")
     defaults = dict(
         min_good_pix_frac=0.5,     # fiber is 'lost' in a channel below this good-pixel fraction
         warn_frac_lost=0.05,       # WARNING: > 5% of science fibers lost (any channel)
@@ -35,6 +37,7 @@ class IncompleteData(Metric):
     values = (
         ValueSpec("sframe_found", "bool", "", "SFrame file found"),
         ValueSpec("dap_found", "bool", "", "DAP file found"),
+        ValueSpec("dap_output_found", "bool", "", "DAP output (model RSS) file found"),
         ValueSpec("n_sci", "i8", "", "Number of science-IFU fibers"),
         ValueSpec("n_lost", "i8", "", "Science fibers without usable data in any channel"),
         ValueSpec("frac_lost", "f8", "", "Fraction of science fibers lost (any channel)"),
@@ -51,7 +54,7 @@ class IncompleteData(Metric):
     def criteria(self):  # type: ignore[override]
         p = self.params
         return {
-            "WARNING": (f"DAP file missing, or >{p['warn_frac_lost']:.0%} of science fibers "
+            "WARNING": (f"DAP file or DAP output (model RSS) file missing, or >{p['warn_frac_lost']:.0%} of science fibers "
                         f"without usable data, or DAP covers <{p['min_dap_coverage']:.0%} of "
                         f"usable science fibers"),
             "MAJOR ISSUE": (f"SFrame missing, or >{p['major_frac_lost_channel']:.0%} of science "
@@ -64,7 +67,8 @@ class IncompleteData(Metric):
         p = self.params
         if not ctx.has_sframe:
             return self.result(QAFlag.MAJOR, note="SFrame missing",
-                               sframe_found=False, dap_found=ctx.has_dap)
+                               sframe_found=False, dap_found=ctx.has_dap,
+                               dap_output_found=ctx.has_dap_output)
 
         sci = ctx.sci_fiber_index
         sm = ctx.slitmap[sci]
@@ -90,7 +94,8 @@ class IncompleteData(Metric):
             if good_ids:
                 dap_cov = len(dap_ids & good_ids) / len(good_ids)
 
-        vals = dict(sframe_found=True, dap_found=ctx.has_dap, n_sci=n_sci,
+        vals = dict(sframe_found=True, dap_found=ctx.has_dap, dap_output_found=ctx.has_dap_output,
+                    n_sci=n_sci,
                     n_lost=int(lost.sum()), frac_lost=frac_lost,
                     frac_lost_b=frac["b"], frac_lost_r=frac["r"], frac_lost_z=frac["z"],
                     max_frac_lost_spec=max_spec, n_fibstatus_bad=n_fibstat,
@@ -106,6 +111,9 @@ class IncompleteData(Metric):
             if not ctx.has_dap:
                 flag = QAFlag.WARNING
                 notes.append("DAP missing")
+            elif not ctx.has_dap_output:
+                flag = QAFlag.WARNING
+                notes.append("DAP output missing")
             if frac_lost > p["warn_frac_lost"]:
                 flag = QAFlag.WARNING
                 notes.append(f"{frac_lost:.1%} science fibers lost")

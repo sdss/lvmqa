@@ -47,3 +47,16 @@ def dap_path(cfg: PipelineConfig, tileid: int, mjd: int, expnum: int,
         if cands:
             return cands[0]
     return expected
+
+
+def dap_output_path(dap_file: Path) -> Path:
+    """DAP model RSS ('output' file) next to the DAP table file:
+    dap-rsp108-sn20-XXXXXXXX.dap.fits.gz -> dap-rsp108-sn20-XXXXXXXX.output.fits.gz
+    (falls back to an uncompressed .output.fits)."""
+    dap_file = Path(dap_file)
+    name = dap_file.name
+    base = name.split(".dap.fits")[0] if ".dap.fits" in name else name
+    cand = dap_file.with_name(f"{base}.output.fits.gz")
+    if not cand.exists() and dap_file.with_name(f"{base}.output.fits").exists():
+        return dap_file.with_name(f"{base}.output.fits")
+    return cand

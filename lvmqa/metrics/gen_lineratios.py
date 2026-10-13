@@ -3,7 +3,7 @@ qa_lineratios - emission-line ratio consistency (General group).
 
 Uses the NON-PARAMETRIC DAP measurements only (the parametric fit fixes the [OIII] and
 [NII] doublet ratios, and parametric-vs-non-parametric consistency is the job of
-qa_dap_npfit). Only fibers where all lines needed by a sub-test have S/N > ``min_snr``
+qa_fit_consistency). Only fibers where all lines needed by a sub-test have S/N > ``min_snr``
 are used.
 
 Sub-tests

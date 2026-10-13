@@ -49,14 +49,16 @@ def _layout(fig, title: str, height: int = 420, **kw):
     return fig
 
 
+def _grid(nrow: int, panel_px: int = 170, gap_px: int = 70, top: int = 90, bottom: int = 60):
+    """Figure height and plotly vertical_spacing for nrow panels of panel_px with gap_px gaps."""
+    plot_h = nrow * panel_px + max(nrow - 1, 0) * gap_px
+    vs = gap_px / plot_h if nrow > 1 else 0.0
+    return plot_h + top + bottom, vs
+
+
 def _flag_columns(result) -> List[tuple]:
-    """[(column, label), ...] for overall, groups and metrics."""
-    t = result.table
+    """[(column, label), ...] for overall and metrics (summaries first, see registry.sort_key)."""
     cols = [("qa_overall", "Overall (bitmask flags)")]
-    for g in GROUPS:
-        c = f"qa_grp_{GROUP_KEYS[g]}"
-        if c in t.colnames and g != GROUP_OBS:   # the observational group summary is qa_obs
-            cols.append((c, f"Group: {g}"))
     for m in result.metrics:
         tag = "" if m.in_bitmask else " [not in bitmask]"
         cols.append((m.name, f"{m.name} ({m.title}){tag}"))
@@ -127,10 +129,18 @@ def fig_counts(result):
                    xaxis_title="number of exposures")
 
 
-def fig_heatmap(result, base, per_metric):
+def fig_heatmap(result, base, per_metric, which="all"):
+    """Status map; which = 'summary' (overall + summary metrics), 'individual' or 'all'."""
     import plotly.graph_objects as go
     t = result.table
     cols = _flag_columns(result)
+    summ = {m.name for m in result.metrics if m.summary}
+    if which == "summary":
+        cols = [c for c in cols if c[0] == "qa_overall" or c[0] in summ]
+    elif which == "individual":
+        cols = [c for c in cols if c[0] != "qa_overall" and c[0] not in summ]
+    if not cols:
+        return None
     code = {s: i for i, s in enumerate(STATUS)}
     z = np.array([[code.get(str(v), 3) for v in t[c]] for c, _ in cols], dtype=float)
     x = [str(int(e)) for e in t["expnum"]]
@@ -144,7 +154,9 @@ def fig_heatmap(result, base, per_metric):
                                zmin=-0.5, zmax=3.5, xgap=gap, ygap=2, showscale=False))
     fig.update_yaxes(autorange="reversed")
     fig.update_xaxes(type="category", showticklabels=len(t) <= 80, title="expnum")
-    return _layout(fig, "Status per exposure (hover for values)", height=140 + 30 * len(cols))
+    ttl = {"summary": "Overall and summary flags per exposure (hover for components)",
+           "individual": "Individual QA flags per exposure (hover for values)"}.get(which, "Status per exposure")
+    return _layout(fig, ttl, height=140 + 30 * len(cols), margin=dict(l=60, r=20, t=50, b=50))
 
 
 def fig_skymap(result, base, per_metric):
@@ -183,12 +195,13 @@ def fig_values_vs_mjd(result, base, per_metric):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     t = result.table
-    ms = [m for m in result.metrics if m.main_value]
+    ms = [m for m in result.metrics if m.main_value and not getattr(m, "status", False)
+          and m.column(m.main_value) in t.colnames]
     if not ms:
         return None
-    titles = [f"{m.column(m.main_value)}" for m in ms]
-    fig = make_subplots(rows=len(ms), cols=1, shared_xaxes=True, subplot_titles=titles,
-                        vertical_spacing=0.08 if len(ms) < 6 else 0.04)
+    titles = [f"{m.name}: {m.column(m.main_value)}" for m in ms]
+    H, vs = _grid(len(ms), panel_px=150, gap_px=55)
+    fig = make_subplots(rows=len(ms), cols=1, shared_xaxes=True, subplot_titles=titles, vertical_spacing=vs)
     mjd = np.asarray(t["mjd"], dtype=float)
     for i, m in enumerate(ms, start=1):
         hv = _hover_for_column(result, m.name, base, per_metric)
@@ -198,24 +211,25 @@ def fig_values_vs_mjd(result, base, per_metric):
             sel = (flags == s) & np.isfinite(y)
             if not sel.any():
                 continue
-            fig.add_trace(go.Scattergl(
+            fig.add_trace(go.Scatter(
                 x=mjd[sel], y=y[sel], mode="markers", name=f"{ICON[s]} {s}", legendgroup=s,
                 showlegend=(i == 1), text=hv[sel], hovertemplate="%{text}<extra></extra>",
                 marker=dict(color=COLORS[s], size=8, line=dict(color=SURFACE, width=1))),
                 row=i, col=1)
     fig.update_xaxes(title="MJD", row=len(ms), col=1)
+    fig.update_xaxes(showticklabels=True, tickformat="d")
     fig.update_annotations(font=dict(size=12, color=INK2), x=0, xanchor="left")
-    return _layout(fig, "Main metric values vs MJD", height=140 + 210 * len(ms))
+    return _layout(fig, "Main metric values vs MJD", height=H, margin=dict(l=70, r=20, t=90, b=60))
 
 
 def fig_flux_pm_np(result, base):
     """log10 median parametric vs non-parametric flux per bright line (one point per exposure)."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
-    m = next((m for m in result.metrics if m.name == "qa_dap_npfit"), None)
+    m = next((m for m in result.metrics if m.name == "qa_fit_consistency"), None)
     if m is None:
         return None
-    from .metrics.dap_npfit import line_key
+    from .metrics.dap_fit_consistency import line_key
     t = result.table
     lines = [l for l in m.params["lines"] if m.column(f"fnp_{line_key(l)}") in t.colnames]
     if not lines:
@@ -267,13 +281,15 @@ def fig_metrics_vs_obs(result):
     from plotly.subplots import make_subplots
     t = result.table
     obs = [m for m in result.metrics if m.group == GROUP_OBS]
-    other = [m for m in result.metrics if m.group != GROUP_OBS]
+    other = [m for m in result.metrics if m.group != GROUP_OBS and not getattr(m, "status", False)
+             and m.name in t.colnames]
     if not obs or not other or not len(t):
         return None
     ncol = 3
     nrow = int(np.ceil(len(other) / ncol))
+    Hg, vsg = _grid(nrow, panel_px=200, gap_px=70, top=110, bottom=50)
     fig = make_subplots(rows=nrow, cols=ncol, subplot_titles=[m.name for m in other],
-                        horizontal_spacing=0.06, vertical_spacing=0.12 if nrow < 4 else 0.07)
+                        horizontal_spacing=0.06, vertical_spacing=vsg)
     buttons = []
     ntr = 0
     for k, om in enumerate(obs):
@@ -305,11 +321,11 @@ def fig_metrics_vs_obs(result):
             vis[j] = True
         menu.append(dict(label=f"split by {name}", method="update", args=[{"visible": vis}]))
     fig.update_layout(barmode="stack",
-                      updatemenus=[dict(buttons=menu, x=0, xanchor="left", y=1.0 + 60 / (140 + 260 * nrow),
+                      updatemenus=[dict(buttons=menu, x=0, xanchor="left", y=1.0 + 60 / (Hg - 160),
                                         yanchor="bottom", bgcolor="white", bordercolor=GRID)])
     fig.update_yaxes(range=[0, 1], tickformat=".0%")
     fig.update_annotations(font=dict(size=12, color=INK2))
-    H = 160 + 260 * nrow
+    H = Hg
     _layout(fig, "", height=H, margin=dict(l=60, r=20, t=110, b=50))
     fig.update_layout(legend=dict(orientation="h", y=1.0 + 60 / H, yanchor="bottom", x=1, xanchor="right"))
     return fig
@@ -319,13 +335,15 @@ def fig_distributions(result):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     t = result.table
-    ms = [m for m in result.metrics if m.main_value]
+    ms = [m for m in result.metrics if m.main_value and not getattr(m, "status", False)
+          and m.name in t.colnames and m.column(m.main_value) in t.colnames]
     if not ms:
         return None
-    ncol = 2
+    ncol = 3
     nrow = int(np.ceil(len(ms) / ncol))
-    fig = make_subplots(rows=nrow, cols=ncol, subplot_titles=[m.column(m.main_value) for m in ms],
-                        horizontal_spacing=0.08, vertical_spacing=0.18 if nrow < 3 else 0.1)
+    H, vs = _grid(nrow, panel_px=190, gap_px=80)
+    fig = make_subplots(rows=nrow, cols=ncol, subplot_titles=[f"{m.name}: {m.column(m.main_value)}" for m in ms],
+                        horizontal_spacing=0.07, vertical_spacing=vs)
     for i, m in enumerate(ms):
         r, c = i // ncol + 1, i % ncol + 1
         y = np.asarray(t[m.column(m.main_value)], dtype=float)
@@ -339,8 +357,8 @@ def fig_distributions(result):
                                        line=dict(color=SURFACE, width=1)), nbinsx=40),
                           row=r, col=c)
     fig.update_layout(barmode="stack")
-    fig.update_annotations(font=dict(size=12, color=INK2))
-    return _layout(fig, "Distributions of main metric values", height=120 + 280 * nrow)
+    fig.update_annotations(font=dict(size=11, color=INK2))
+    return _layout(fig, "Distributions of main metric values", height=H, margin=dict(l=60, r=20, t=90, b=60))
 
 
 CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
@@ -349,7 +367,9 @@ CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
 def _timing_components(result):
     """[(column, label), ...]: I/O first, then metric compute times."""
     t = result.table
-    comps = [("time_io_sframe", "I/O: SFrame"), ("time_io_dap", "I/O: DAP")]
+    comps = [("time_io_sframe", "I/O: SFrame"), ("time_io_dap", "I/O: DAP"),
+             ("time_io_dap_output", "I/O: DAP output"),
+             ("time_shared_skylines", "Shared: sky-line fits")]
     comps += [(f"time_{m.short}", m.name) for m in result.metrics]
     return [(c, l) for c, l in comps if c in t.colnames]
 
@@ -358,7 +378,7 @@ def _with_inputs(result) -> np.ndarray:
     """Exposures for which input files were actually read."""
     t = result.table
     io = np.zeros(len(t))
-    for c in ("time_io_sframe", "time_io_dap"):
+    for c in ("time_io_sframe", "time_io_dap", "time_io_dap_output"):
         if c in t.colnames:
             io += np.nan_to_num(np.asarray(t[c], dtype=float))
     return io > 0
@@ -464,7 +484,106 @@ code { font-size:12px; }
 """ % FONT
 
 
+def fig_fluxmap(result, base):
+    """Multi-tile flux consistency: tile centres coloured by the fitted flux-scale offset."""
+    import plotly.graph_objects as go
+    t = result.table
+    m = next((m for m in result.metrics if m.name == "qa_fluxmap"), None)
+    if m is None or "sci_ra" not in t.colnames:
+        return None
+    s = np.asarray(t[m.column("s_dex")], dtype=float)
+    ok = np.isfinite(s)
+    if not ok.any():
+        return None
+    flags = np.asarray(t[m.name]).astype(str)
+    ra, dec = np.asarray(t["sci_ra"], float), np.asarray(t["sci_dec"], float)
+    # show the region of the solved tiles only (+-1 deg); far-away unsolved exposures are omitted
+    r0, r1 = np.nanmin(ra[ok]) - 1.0, np.nanmax(ra[ok]) + 1.0
+    d0, d1 = np.nanmin(dec[ok]) - 1.0, np.nanmax(dec[ok]) + 1.0
+    inside = (ra >= r0) & (ra <= r1) & (dec >= d0) & (dec <= d1)
+    fig = go.Figure()
+    sym = {"GOOD": "circle", "WARNING": "diamond", "MAJOR ISSUE": "x", "UNDEFINED": "circle-open"}
+    for st in STATUS:
+        sel = (flags == st) & inside
+        if not sel.any():
+            continue
+        txt = [f"{b}<br>{m.name}: {st}<br>s = {v:+.3f} dex ({10 ** v if np.isfinite(v) else np.nan:.2f}x)"
+               f"<br>edges {int(ne)} (rejected {int(nr)})"
+               for b, v, ne, nr in zip(base[sel], s[sel], np.asarray(t[m.column("n_edges")])[sel],
+                                       np.asarray(t[m.column("n_rejected")])[sel])]
+        fig.add_trace(go.Scatter(
+            x=np.asarray(t["sci_ra"], float)[sel], y=np.asarray(t["sci_dec"], float)[sel],
+            mode="markers", name=f"{ICON[st]} {st}", text=txt, hovertemplate="%{text}<extra></extra>",
+            marker=dict(size=26, symbol=sym[st], color=np.nan_to_num(s[sel]), cmin=-0.1, cmax=0.1,
+                        colorscale="RdBu_r", line=dict(color=COLORS[st], width=3),
+                        colorbar=dict(title="s [dex]") if st == "GOOD" else None)))
+    fig.update_xaxes(title="RA [deg]", autorange="reversed")
+    fig.update_yaxes(title="Dec [deg]", scaleanchor="x",
+                     scaleratio=1.0 / max(np.cos(np.deg2rad(np.nanmedian(dec[ok]))), 0.05))
+    return _layout(fig, "Flux-scale offsets from tile overlaps (qa_fluxmap; colour = s, outline = status)",
+                   height=560)
+
+
+def fig_tile_status(result):
+    """Tile status (information) as a map: rows = status_* columns, columns = exposures."""
+    import plotly.graph_objects as go
+    sm = [m for m in result.metrics if m.status]
+    t = result.table
+    if not sm or not len(t):
+        return None
+    m = sm[0]
+    cols = [m.column(v.name) for v in m.values if v.dtype == "bool"]
+    extra = {"status_auroral": ("frac_auroral", "best_auroral"), "status_bright": ("frac_bright", None),
+             "status_faint": ("frac_faint", "best_faint"), "status_sp": ("n_sp_regions", None)}
+    x = [str(int(e)) for e in t["expnum"]]
+    z, text = [], []
+    for c in cols:
+        v = np.asarray(t[c]).astype(bool)
+        z.append(v.astype(float))
+        fx, bx = extra.get(c, (None, None))
+        row = []
+        for i, r in enumerate(t):
+            h = f"expnum {r['expnum']} tile {r['tileid']} mjd {r['mjd']}<br>{r['object']}<br><b>{c} = {bool(v[i])}</b>"
+            if fx and m.column(fx) in t.colnames:
+                h += f"<br>{fx}: {_fmt(r[m.column(fx)])}"
+            if bx and m.column(bx) in t.colnames:
+                h += f"<br>{bx}: {_fmt(r[m.column(bx)])}"
+            row.append(h)
+        text.append(row)
+    cs = [[0, "#e7e6df"], [0.5, "#e7e6df"], [0.5, "#2a78d6"], [1, "#2a78d6"]]
+    gap = 1 if len(t) < 400 else 0
+    fig = go.Figure(go.Heatmap(z=np.array(z), x=x, y=[c.replace("status_", "") for c in cols], text=text,
+                               hovertemplate="%{text}<extra></extra>", colorscale=cs, zmin=0, zmax=1,
+                               xgap=gap, ygap=2, showscale=False))
+    for lab, col in (("True", "#2a78d6"), ("False", "#e7e6df")):
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name=lab,
+                                 marker=dict(color=col, size=12, symbol="square")))
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(type="category", showticklabels=len(t) <= 80, title="expnum")
+    ntrue = ", ".join(f"{c.replace('status_', '')} {int(np.sum(np.asarray(t[c]).astype(bool)))}" for c in cols)
+    return _layout(fig, f"Tile status (information, not QA flags); exposures with True: {ntrue}",
+                   height=140 + 40 * len(cols))
+
+
+def status_table_html(result) -> str:
+    sm = [m for m in result.metrics if m.status]
+    t = result.table
+    if not sm or not len(t):
+        return ""
+    cols = [m.column(v.name) for m in sm for v in m.values if v.dtype == "bool"]
+    rows = [{"expnum": str(r["expnum"]), "tileid": str(r["tileid"]), "object": str(r["object"]),
+             **{c: ("True" if bool(r[c]) else "False") for c in cols}} for r in t]
+    tot = {c: int(np.sum(np.asarray(t[c], bool))) for c in cols}
+    head = "<p class='meta'>Information per tile (not QA flags). Number of exposures with True: " + \
+        ", ".join(f"<code>{c}</code> {tot[c]}" for c in cols) + "</p>"
+    return head + _table_html(rows, ["expnum", "tileid", "object"] + cols)
+
+
 def write_html(result, path) -> Path:
+    import copy
+    full = result
+    result = copy.copy(full)
+    result.metrics = [m for m in full.metrics if not m.status]   # flag metrics only
     t = result.table
     cfg = result.config
     figs = []
@@ -473,11 +592,13 @@ def write_html(result, path) -> Path:
         base = _hover_base(result)
         per_metric = {m.name: _hover_metric(result, m, notes) for m in result.metrics}
         figs = [("Status counts", fig_counts(result)),
-                ("Status map", fig_heatmap(result, base, per_metric)),
+                ("Status map: overall and summaries", fig_heatmap(result, base, per_metric, "summary")),
+                ("Status map: individual QA flags", fig_heatmap(result, base, per_metric, "individual")),
                 ("Sky map", fig_skymap(result, base, per_metric)),
                 ("Values vs MJD", fig_values_vs_mjd(result, base, per_metric)),
-                ("DAP: parametric vs non-parametric fluxes (bright lines, fibers with NP S/N > min_snr; colour = qa_dap_npfit)",
+                ("DAP: parametric vs non-parametric fluxes (bright lines, fibers with NP S/N > min_snr; colour = qa_fit_consistency)",
                  fig_flux_pm_np(result, base)),
+                ("DAP: multi-tile flux consistency (qa_fluxmap)", fig_fluxmap(result, base)),
                 ("Distributions", fig_distributions(result)),
                 ("QA metrics vs observational conditions (fraction of exposures per status of the "
                  "selected observational flag)", fig_metrics_vs_obs(result))]
@@ -531,9 +652,15 @@ def write_html(result, path) -> Path:
         for s in STATUS)
 
     from .output import build_desc_table
-    desc = build_desc_table(result)
+    desc = build_desc_table(full)
+    ft = fig_tile_status(full)
+    status_html = ""
+    if ft is not None:
+        status_html = '<div class="card">' + ft.to_html(full_html=False, include_plotlyjs="cdn" if first else False,
+                                                         config={"displaylogo": False, "responsive": True}) + "</div>"
+        first = False
     desc_rows = [{c: str(r[c]) for c in desc.colnames} for r in desc]
-    desc_html = _table_html(desc_rows, ["Metric", "Group", "Bits", "Description", "WARNING",
+    desc_html = _table_html(desc_rows, ["Metric", "Role", "Bits", "Description", "WARNING",
                                         "MAJOR ISSUE", "Parameters"])
 
     flagged = [r for r in t if str(r["qa_overall"]) != "GOOD"]
@@ -555,9 +682,10 @@ def write_html(result, path) -> Path:
 <div class="meta">lvmqa {__version__} &middot; generated {_dt.datetime.utcnow():%Y-%m-%d %H:%M} UTC &middot;
 {len(t)} exposures &middot; selection: {_html.escape(sel_txt)}<br>
 files: {files}<br>
-metrics: {", ".join(f"<code>{m.name}</code> [{_html.escape(m.group)}]" for m in result.metrics)}</div>
+metrics: {", ".join(f"<code>{m.name}</code>" + (" (summary)" if m.summary else "") for m in result.metrics)}</div>
 <h2>Overall status</h2><div class="tiles">{tiles}</div>
 {''.join(parts)}
+<h2>Tile status (information)</h2>{status_html}
 <h2>Processing time</h2>{''.join(tparts)}
 <h2>Metric definitions</h2>{desc_html}
 <h2>Exposures not GOOD ({len(flagged)})</h2>{flagged_html}{more}

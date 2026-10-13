@@ -2,8 +2,14 @@
 qa_guider - guiding / sky conditions from the guider co-add keywords in the SFrame header
 (GDRCOADD *: written by the guider co-add of the science telescope).
 
-Uses the guider warnings (transparency, FWHM, PA drift, Gaia match), the astrometric
-solution flag and the median FWHM of the guider frames. Component of qa_obs ("hard").
+Uses the guider warnings (transparency, FWHM, Gaia match), the astrometric solution flag and
+the median FWHM of the guider frames. Component of qa_obs ("hard").
+
+The PA-drift warning (WARNPADR) is not used: the resulting displacement at the edge of the
+field is small compared to the 35.3 arcsec fibers. PADRIFT is kept as a diagnostic.
+FWHM limits: guider FWHM is typically 2.7-5 arcsec (16-cm telescopes); a Gaussian PSF of even
+10 arcsec FWHM keeps >99.9% of a point source within a 35.3 arcsec fiber, so the FWHM criterion
+flags degraded conditions (focus, clouds, guiding) rather than aperture losses.
 """
 
 from __future__ import annotations
@@ -40,21 +46,19 @@ class Guider(Metric):
     obs_weight = "hard"
     group = GROUP_OBS
     title = "Guiding / transparency (guider co-add)"
-    description = ("Obs. conditions from the guider co-add header keywords: transparency, FWHM, "
-                   "PA-drift and Gaia-match warnings, astrometric solution, median FWHM")
+    description = ("Obs. conditions from the guider co-add header keywords: transparency, FWHM "
+                   "and Gaia-match warnings, astrometric solution, median FWHM")
     requires = ("sframe_header",)
     defaults = dict(
-        fwhm_warn=5.0,              # median guider FWHM [arcsec] above -> WARNING
-        fwhm_major=8.0,             # median guider FWHM [arcsec] above -> MAJOR
+        fwhm_warn=6.0,              # median guider FWHM [arcsec] above -> WARNING
+        fwhm_major=10.0,            # median guider FWHM [arcsec] above -> MAJOR
         transparency_major=False,   # True: poor-transparency warning -> MAJOR (default WARNING)
-        padrift_warn=True,          # use the guider PA-drift warning (WARNPADR) as WARNING
         fov_radius_arcsec=906.5,    # for the diagnostic displacement at the FoV edge
     )
     values = (
         ValueSpec("solved", "bool", "", "Guider co-add astrometrically solved"),
         ValueSpec("warn_tran", "bool", "", "Poor-transparency warning (WARNTRAN)"),
         ValueSpec("warn_fwhm", "bool", "", "Co-added FWHM significantly above median (WARNFWHM)"),
-        ValueSpec("warn_padr", "bool", "", "PA drift > 0.7 arcmin warning (WARNPADR)"),
         ValueSpec("warn_match", "bool", "", "Co-add could not be matched with Gaia (WARNMATC)"),
         ValueSpec("fwhm_med", "f8", "arcsec", "Median FWHM of the guider frames (FWHMMED)"),
         ValueSpec("fwhm_first", "f8", "arcsec", "FWHM in the first guider frame (FWHM0)"),
@@ -74,7 +78,6 @@ class Guider(Metric):
             "GOOD": f"No guider warning and median FWHM <= {p['fwhm_warn']:g} arcsec",
             "WARNING": ("Guider warning: " + ("poor transparency, " if tran == "WARNING" else "")
                         + "co-added FWHM above median"
-                        + (", PA drift" if p["padrift_warn"] else "")
                         + f"; or median FWHM > {p['fwhm_warn']:g} arcsec"),
             "MAJOR ISSUE": ("Guider co-add not astrometrically solved or not matched with Gaia"
                             + (", or poor transparency" if tran == "MAJOR" else "")
@@ -91,12 +94,12 @@ class Guider(Metric):
         if not any((PREFIX + k) in h for k in ("SOLVED", "FWHMMED", "WARNTRAN")):
             return self.result(QAFlag.UNDEFINED, note="no guider keywords")
         solved, tran, fwhmw = _bool(g("SOLVED")), _bool(g("WARNTRAN")), _bool(g("WARNFWHM"))
-        padr, match = _bool(g("WARNPADR")), _bool(g("WARNMATC"))
+        match = _bool(g("WARNMATC"))
         fwhm = _float(g("FWHMMED"))
         padrift = _float(g("PADRIFT"))
         nfr = _float(g("NFRAMES"))
         vals = dict(solved=bool(solved), warn_tran=bool(tran), warn_fwhm=bool(fwhmw),
-                    warn_padr=bool(padr), warn_match=bool(match),
+                    warn_match=bool(match),
                     fwhm_med=fwhm if fwhm is not None else float("nan"),
                     fwhm_first=_float(g("FWHM0")) or float("nan"),
                     fwhm_last=_float(g("FWHMN")) or float("nan"),
@@ -118,8 +121,6 @@ class Guider(Metric):
             warn.append(f"FWHM {fwhm:.1f}\"")
         if fwhmw:
             warn.append("FWHM above median")
-        if padr and p["padrift_warn"]:
-            warn.append(f"PA drift {padrift:.3f} deg")
         if major:
             return self.result(QAFlag.MAJOR, note=", ".join(major + warn), **vals)
         if warn:

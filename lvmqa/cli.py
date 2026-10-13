@@ -31,7 +31,7 @@ def parse_int_list(tokens: Optional[Sequence[str]]) -> Optional[List[int]]:
 
 
 def parse_metric_options(items: Optional[Sequence[str]]) -> Dict[str, Dict]:
-    """['qa_dap_npfit.min_snr=3', ...] -> {'qa_dap_npfit': {'min_snr': 3}}"""
+    """['qa_fit_consistency.min_snr=3', ...] -> {'qa_fit_consistency': {'min_snr': 3}}"""
     opts: Dict[str, Dict] = {}
     for it in items or ():
         key, _, val = it.partition("=")
@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("--metric-module", action="append", default=[], metavar="MOD",
                     help="extra module (dotted name or .py file) defining metrics; repeatable")
     mg.add_argument("--set", action="append", default=[], metavar="METRIC.PARAM=VALUE",
-                    help="override a metric parameter, e.g. qa_dap_npfit.min_snr=3; repeatable")
+                    help="override a metric parameter, e.g. qa_fit_consistency.min_snr=3; repeatable")
     mg.add_argument("--list-metrics", action="store_true", help="list available metrics and exit")
     pg = ap.add_argument_group("paths")
     pg.add_argument("--redux-dir", help="root of DRP products (default: $LVM_SPECTRO_REDUX or dev path)")
@@ -125,7 +125,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from collections import Counter
         print(f"\n{len(t)} exposures; overall: {dict(Counter(str(x) for x in t['qa_overall']))}")
         for m in res.metrics:
-            print(f"  {m.name:18s} {dict(Counter(str(x) for x in t[m.name]))}")
+            if getattr(m, "status", False):
+                for c in [m.column(v.name) for v in m.values if v.dtype in ("?", "bool")]:
+                    print(f"  {c:18s} {dict(Counter(str(x) for x in t[c]))}")
+            elif m.name in t.colnames:
+                print(f"  {m.name:18s} {dict(Counter(str(x) for x in t[m.name]))}")
     for k, p in res.files.items():
         print(f"  {k:12s} {p}")
     return 0

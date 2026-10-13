@@ -19,7 +19,7 @@ from . import __version__
 from .bitmask import FLAG_LABELS, QAFlag, combine, pack
 from .config import PipelineConfig
 from .context import ExposureContext
-from .registry import GROUP_KEYS, GROUPS, Metric, build_metrics, load_metric_module
+from .registry import Metric, MetricResult, build_metrics, load_metric_module
 
 log = logging.getLogger("lvmqa")
 
@@ -28,7 +28,9 @@ log = logging.getLogger("lvmqa")
 MAIN_ID_COLUMNS = ("expnum", "tileid", "mjd", "object")
 ID_COLUMNS = MAIN_ID_COLUMNS + ("exptime", "obstime", "dpos", "sci_ra", "sci_dec", "sci_pa",
                                 "sci_amass", "fluxcal")
-IO_KEYS = ("io_sframe", "io_dap")
+IO_KEYS = ("io_sframe", "io_dap", "io_dap_output")
+# computations shared between metrics (ExposureContext.shared): key -> description
+SHARED_KEYS = {"shared_skylines": "Shared sky-line Gaussian fits (qa_wavecal_*, qa_lsf)"}
 
 
 @dataclass
@@ -104,32 +106,75 @@ def process_exposure(cfg: PipelineConfig, row: Dict[str, Any],
     rec: Dict[str, Any] = {"flags": {}, "values": {}, "notes": {}, "timing": {}}
     results = {}
     with ExposureContext(cfg, row) as ctx:
-        for m in [m for m in metrics if not m.summary] + [m for m in metrics if m.summary]:
-            if m.summary:
-                tm = time.perf_counter()
-                res = m.safe_summarize(results, metrics, ctx.expnum)
-                results[m.name] = res
-                rec["timing"][m.name] = time.perf_counter() - tm
-                rec["flags"][m.name] = int(res.flag)
-                rec["values"][m.name] = res.values
-                if res.note:
-                    rec["notes"][m.name] = res.note
-                continue
+        for m in metrics:
+            if "dap_output" in m.requires:
+                ctx.request_output(m.output_windows())
+        rec["payloads"] = {}
+        for m in [m for m in metrics if not m.summary]:
             tm, io0 = time.perf_counter(), ctx.io_time
+            if m.multi:
+                # multi-exposure metric: only collect the per-exposure payload here
+                try:
+                    rec["payloads"][m.name] = m.collect(ctx)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("%s collect failed for expnum %s: %s", m.name, ctx.expnum, exc)
+                    rec["payloads"][m.name] = None
+                rec["timing"][m.name] = (time.perf_counter() - tm) - (ctx.io_time - io0)
+                rec["flags"][m.name] = int(QAFlag.UNDEFINED)
+                rec["values"][m.name] = m.empty_values()
+                continue
             res = m.safe_compute(ctx)
-            results[m.name] = res
             # compute time of the metric, excluding the (shared, lazily loaded) input I/O
             rec["timing"][m.name] = (time.perf_counter() - tm) - (ctx.io_time - io0)
             rec["flags"][m.name] = int(res.flag)
             rec["values"][m.name] = res.values
             if res.note:
                 rec["notes"][m.name] = res.note
-        for k in IO_KEYS:
+        for k in set(IO_KEYS) | set(ctx.timings):
             rec["timing"][k] = float(ctx.timings.get(k, 0.0))
     rec["expnum"] = int(row["expnum"])
     rec["runtime"] = time.perf_counter() - t0
     rec["timing"]["total"] = rec["runtime"]
     return rec
+
+
+def finalize_records(records: List[Dict[str, Any]], metrics: List[Metric], cfg: PipelineConfig,
+                     drpall: Table) -> None:
+    """Main process: multi-exposure metrics (from the collected payloads), then summaries."""
+    by_exp = {r["expnum"]: r for r in records}
+    for m in [m for m in metrics if m.multi]:
+        t0 = time.perf_counter()
+        payloads = {e: r.get("payloads", {}).get(m.name) for e, r in by_exp.items()}
+        try:
+            res = m.compute_multi(payloads, cfg, drpall)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            log.error("%s failed: %s\n%s", m.name, exc, traceback.format_exc())
+            res = {e: m.result(QAFlag.UNDEFINED, note=f"error: {type(exc).__name__}: {exc}") for e in by_exp}
+        dt = (time.perf_counter() - t0) / max(len(by_exp), 1)
+        for e, r in by_exp.items():
+            rr = res.get(e) or m.result(QAFlag.UNDEFINED, note="no result")
+            vals = m.empty_values()
+            vals.update(rr.values)
+            r["flags"][m.name] = int(rr.flag)
+            r["values"][m.name] = vals
+            r["timing"][m.name] = r["timing"].get(m.name, 0.0) + dt
+            if rr.note:
+                r["notes"][m.name] = rr.note
+    summaries = [m for m in metrics if m.summary]
+    for r in records:
+        results = {name: MetricResult(QAFlag(f), r["values"].get(name, {}), r["notes"].get(name, ""))
+                   for name, f in r["flags"].items()}
+        for m in summaries:
+            tm = time.perf_counter()
+            res = m.safe_summarize(results, metrics, r["expnum"])
+            results[m.name] = res
+            r["timing"][m.name] = time.perf_counter() - tm
+            r["flags"][m.name] = int(res.flag)
+            r["values"][m.name] = res.values
+            if res.note:
+                r["notes"][m.name] = res.note
+        r.pop("payloads", None)
 
 
 def _process_in_worker(args):
@@ -163,19 +208,14 @@ def build_table(rows: Table, records: List[Dict[str, Any]], metrics: List[Metric
         bitmask[i] = pack({**not_run, **{m.slot: flags[m.name][i] for m in bm}})
     out["qa_bitmask"] = bitmask
 
-    # overall (bitmask metrics only) + per-group summary flags (HTML only)
+    # overall (bitmask metrics only); the science summaries replace the former per-group flags
     out["qa_overall"] = [FLAG_LABELS[combine(flags[m.name][i] for m in bm)]
                          for i in range(n)]
-    for g in GROUPS:
-        gm = [m for m in bm if m.group == g]
-        if not gm:
-            continue
-        out[f"qa_grp_{GROUP_KEYS[g]}"] = [
-            FLAG_LABELS[combine(flags[m.name][i] for m in gm)] for i in range(n)]
 
-    # per-metric flags (human readable, DR20 style)
+    # per-metric flags (human readable, DR20 style); status metrics have no flag
     for m in metrics:
-        out[m.name] = [FLAG_LABELS[QAFlag(f)] for f in flags[m.name]]
+        if not m.status:
+            out[m.name] = [FLAG_LABELS[QAFlag(f)] for f in flags[m.name]]
 
     # per-metric measured values
     for m in metrics:
@@ -198,7 +238,10 @@ def build_table(rows: Table, records: List[Dict[str, Any]], metrics: List[Metric
     # timing [s]
     tcols = [("total", "time_total", "Wall time for the exposure (inputs + all metrics)"),
              ("io_sframe", "time_io_sframe", "Time reading SFrame header / tables / data"),
-             ("io_dap", "time_io_dap", "Time reading DAP tables")]
+             ("io_dap", "time_io_dap", "Time reading DAP tables"),
+             ("io_dap_output", "time_io_dap_output", "Time reading the DAP output (model RSS) file")]
+    present = {k for e in rows["expnum"] for k in by_exp[int(e)]["timing"]}
+    tcols += [(k, f"time_{k}", d) for k, d in SHARED_KEYS.items() if k in present]
     tcols += [(m.name, f"time_{m.short}", f"Compute time of {m.name} (excluding input I/O)")
               for m in metrics]
     for key, col, desc in tcols:
@@ -285,6 +328,7 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
             records.append(rec)
             _log_progress(i, len(row_dicts), rec)
 
+    finalize_records(records, mlist, cfg, drpall)
     table = build_table(rows, records, mlist, cfg)
     selection = {"expnums": list(expnums or []), "mjds": list(mjds or []),
                  "tileids": list(tileids or []), "existing_only": existing_only}

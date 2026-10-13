@@ -65,7 +65,7 @@ class PipelineConfig:
     cache_dir: Optional[Path] = None
     dap_n_models: int = DEFAULT_DAP_N_MODELS
     dap_target_snr: int = DEFAULT_DAP_TARGET_SNR
-    # per-metric parameter overrides: {"qa_dap_npfit": {"min_snr": 3}, ...}
+    # per-metric parameter overrides: {"qa_fit_consistency": {"min_snr": 3}, ...}
     metric_options: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

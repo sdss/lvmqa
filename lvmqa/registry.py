@@ -31,11 +31,14 @@ GROUP_OBS = "Observational conditions"
 GROUP_DRP = "DRP quality"
 GROUP_DAP = "DAP quality"
 GROUP_GEN = "General"
+GROUP_SCI = "Science summary"
+GROUP_STATUS = "Tile status (information)"
 # order used for sorting metrics in tables and in the HTML report
-GROUPS: Tuple[str, ...] = (GROUP_OBS, GROUP_GEN, GROUP_DRP, GROUP_DAP)
-GROUP_KEYS = {GROUP_OBS: "obs", GROUP_DRP: "drp", GROUP_DAP: "dap", GROUP_GEN: "gen"}
+GROUPS: Tuple[str, ...] = (GROUP_SCI, GROUP_OBS, GROUP_GEN, GROUP_DRP, GROUP_DAP, GROUP_STATUS)
+GROUP_KEYS = {GROUP_SCI: "sci", GROUP_OBS: "obs", GROUP_DRP: "drp", GROUP_DAP: "dap",
+              GROUP_GEN: "gen", GROUP_STATUS: "status"}
 
-INPUTS = ("drpall", "sframe_header", "sframe_data", "dap")
+INPUTS = ("drpall", "sframe_header", "sframe_data", "dap", "dap_output")
 
 
 class MissingInputError(RuntimeError):
@@ -73,6 +76,13 @@ class Metric:
     # which enter the bitmask only through the qa_obs summary)
     slot: Optional[int] = None
     summary: bool = False      # summary metrics are computed from other metrics' results
+    # science summaries: {component metric name: 'hard' | 'soft'} (see metrics/sci_summary.py)
+    components: Dict[str, str] = {}
+    # status (information) metrics: boolean values reported per tile, no QA flag / bitmask
+    status: bool = False
+    # multi-exposure metrics: per-exposure collect(ctx) in the workers, then
+    # compute_multi(payloads, cfg, drpall) in the main process (e.g. qa_fluxmap)
+    multi: bool = False
     # for components of qa_obs (group "Observational conditions"):
     #   "hard": WARNING -> WARNING, MAJOR -> MAJOR ;  "soft": MAJOR -> WARNING, WARNING -> GOOD
     obs_weight: str = "hard"
@@ -117,6 +127,19 @@ class Metric:
         """Called once in the main process before exposures are processed
         (e.g. to download / build caches). May update ``self.params``."""
 
+    def output_windows(self) -> Dict[str, Tuple[float, float, Tuple[int, ...]]]:
+        """Wavelength windows of the DAP output (model RSS) file needed by the metric:
+        {key: (wmin, wmax, planes)}. All windows of all metrics are read in one pass."""
+        return {}
+
+    def collect(self, ctx) -> Any:
+        """multi-exposure metrics: per-exposure payload (small, picklable)."""
+        return None
+
+    def compute_multi(self, payloads: Dict[int, Any], cfg, drpall) -> Dict[int, "MetricResult"]:
+        """multi-exposure metrics: results per expnum from the payloads of all exposures."""
+        raise NotImplementedError
+
     def compute(self, ctx) -> MetricResult:  # pragma: no cover - abstract
         raise NotImplementedError
 
@@ -142,6 +165,12 @@ class Metric:
 
     @property
     def role(self) -> str:
+        if self.status:
+            return "status (information, not a QA flag)"
+        if self.summary and self.components:
+            return "science summary"
+        if self.multi:
+            return "bitmask (multi-exposure)"
         if self.summary:
             return "summary"
         if self.group == GROUP_OBS:
@@ -181,7 +210,9 @@ def register(cls: Type[Metric]) -> Type[Metric]:
     if cls.group == GROUP_OBS and not cls.summary and cls.slot is not None:
         raise ValueError(f"{cls.name}: observational-condition components must have slot=None "
                          f"(they enter the bitmask through qa_obs)")
-    if cls.group != GROUP_OBS and not cls.summary and cls.slot is None:
+    if cls.status and cls.slot is not None:
+        raise ValueError(f"{cls.name}: status metrics are not stored in the bitmask")
+    if cls.group != GROUP_OBS and not cls.summary and not cls.status and cls.slot is None:
         raise ValueError(f"{cls.name}: a bitmask slot is required")
     if cls.obs_weight not in ("hard", "soft"):
         raise ValueError(f"{cls.name}: obs_weight must be 'hard' or 'soft'")
@@ -236,9 +267,12 @@ def build_metrics(names: Optional[Sequence[str]] = None,
         if missing:
             raise KeyError(f"unknown metric(s) {missing}; available: {list(reg)}")
         selected = [reg[n] for n in names]
-        # a summary metric needs the components of its group
+        # a summary metric needs its components (science summaries: ``components``;
+        # qa_obs: the other metrics of its group)
         for cls in list(selected):
-            if cls.summary:
+            if cls.summary and cls.components:
+                selected += [reg[c] for c in cls.components if c in reg and reg[c] not in selected]
+            elif cls.summary:
                 selected += [c for c in reg.values() if c.group == cls.group and not c.summary
                              and c not in selected]
     else:

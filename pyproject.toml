@@ -12,6 +12,7 @@ dependencies = ["numpy", "astropy>=5", "plotly>=5", "openpyxl"]
 
 [project.optional-dependencies]
 hipparcos = ["astroquery"]
+multitile = ["scipy"]
 
 [project.scripts]
 lvmqa = "lvmqa.cli:main"
