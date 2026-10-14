@@ -2,14 +2,27 @@
 qa_relflux_br / qa_relflux_rz - relative flux calibration: continuum continuity across the
 b-r and r-z channel boundaries.
 
-v1.9 (flagging): step of the continuum at the channel overlap (lvmdrp fluxCalMethod overlaps
-b-r 5775-5825, r-z 7520-7580 A) as a fraction of the continuum. Per fiber, the unmasked pixels of
-each side window are reduced to 10-A bin medians (robust to residual line spikes) and a straight
-line is fitted per side and extrapolated to the overlap centre:
-    J = (L_red - L_blue) / mean(L_red, L_blue)
-Side windows: b-r 5525-5775 | 5825-6075 A; r-z 7180-7520 | 7740-8100 A (the red r-z side starts
-after the O2 A band and after the bluest z pixels, whose line residuals steepened the fit).
-Telluric bands are excluded (O2 A 7590-7710, H2O 7150-7350 A). Two signals:
+v1.13 (flagging): continuum continuity at the channel overlap (lvmdrp fluxCalMethod overlaps
+b-r 5775-5825, r-z 7520-7580 A). Per fiber, the unmasked pixels of each side window are reduced to
+10-A bin medians (robust to residual line spikes) and a straight line (level a, slope b at the
+overlap centre x0) is fitted per side. Two statistics (medians over the fibers, normalised by the
+fiber level (a_blue + a_red)/2):
+    step           J = (a_red - a_blue) / level         jump of the continuum at x0
+    slope mismatch K = (b_red - b_blue) * L / level      divergence of the two side continua L = 250 A
+                                                         from x0 (a kink: opposite / different gradients)
+A common gradient gives J = K = 0. Intrinsic curvature of stellar continua gives |K| <~ 0.01-0.03
+(blackbodies 3500-20000 K). Errors: 1.2533 NMAD / sqrt(n_fibers).
+GOOD     |J| <= 3% and |K| <= 5%, or not significant (< 3 sigma)
+WARNING  |J| > 3% or |K| > 5% (significant)
+MAJOR    |J| > 8% or |K| > 10% (significant)
+(v1.10-1.12 used J only: a strong kink with a small step at x0, e.g. 1.2.0 7959 b-r J +1.8%,
+K +14%, was GOOD; insignificant steps of faint fields, e.g. 1.3.2 5353 b-r J -3.2 +- 2.4%, were
+WARNING.)
+Side windows: b-r 5525-5775 | 5825-6075 A; r-z 6950-7520 | 7740-8100 A (v1.13: the r side was
+7180-7520 A, of which only 7350-7520 A survived the H2O mask -> noisy, biased slopes; now 7040-7350
+is masked (H2O, TiO 7054 head, HeI 7065, [ArIII] 7136), leaving 6950-7040 + 7350-7520 A; the red
+side starts after the O2 A band and the bluest z pixels, whose line residuals steepened the fit).
+Telluric bands are excluded (O2 A 7590-7710, H2O 7150-7350, O2 B 6860-6940 A). Two signals:
   * 'src' = FLUX of fibers with continuum S/N >= 5 (stars, bright nebulae); masked: sky lines
             (sky > 1.5 x its own running 20th percentile) and emission lines in the source stack
             (> 10% above its running 20th percentile). Adopted if >= 10 fibers.
@@ -17,10 +30,6 @@ Telluric bands are excluded (O2 A 7590-7710, H2O 7150-7350 A). Two signals:
             above the running 20th percentile of the median spectrum. Biased by the sky-continuum
             shape (b-r +0.04...+0.13, r-z +0.16...+0.37 on DRP 1.3.2), so at most WARNING at b-r
             and not used at r-z (UNDEFINED without bright fibers).
-GOOD |median J| <= 3%, WARNING 3-8%, MAJOR > 8%.
-(v1.8 used 5% masks on the obs stack for both signals and pixel-level fits: only ~30 red r-z
-pixels survived.) DRP 1.2.0: b-r steps -21 ... +17% (sign varies per exposure); DRP 1.3.2:
-b-r -2 ... +5% (tile 11111 ~+10%).
 
 DR20 statistic (still reported, values *_dr20; scripts/continuum/DRPCubeQA.py):
 
@@ -116,12 +125,13 @@ def _binned(w, y, m, binw):
     return np.array(xc), np.vstack(cols).T
 
 
-def _side_fit(w, y, m, x0, binw=10.0, min_bins=4):
+def _side_line(w, y, m, x0, binw=10.0, min_bins=4):
     """Straight line per row through the 10-A bin medians of the unmasked pixels m (robust to
-    residual line spikes); value at x0 (NaN with < min_bins bins)."""
+    residual line spikes): (level at x0, slope per A); NaN with < min_bins bins."""
     x, Y = _binned(w, y, m, binw)
     if x.size < min_bins:
-        return np.full(y.shape[0], np.nan)
+        nan = np.full(y.shape[0], np.nan)
+        return nan, nan.copy()
     x = x - x0
     ok = np.isfinite(Y)
     W = ok.astype(float)
@@ -131,8 +141,16 @@ def _side_fit(w, y, m, x0, binw=10.0, min_bins=4):
     with np.errstate(invalid="ignore", divide="ignore"):
         det = S * Sxx - Sx ** 2
         a = (Sy * Sxx - Sx * Sxy) / det
-    a[S < min_bins] = np.nan
-    return a
+        b = (S * Sxy - Sx * Sy) / det
+    bad = S < min_bins
+    a[bad] = np.nan
+    b[bad] = np.nan
+    return a, b
+
+
+def _side_fit(w, y, m, x0, binw=10.0, min_bins=4):
+    """Level at x0 of the straight-line side fit (see _side_line)."""
+    return _side_line(w, y, m, x0, binw, min_bins)[0]
 
 
 def line_mask_from(w, G, thresh, k=61, dilate=1):
@@ -146,21 +164,79 @@ def line_mask_from(w, G, thresh, k=61, dilate=1):
     return lm
 
 
-def boundary_jumps(w, y, overlap, blue, red, line_mask):
-    """Per-row fractional continuum step at the overlap centre: straight lines through the bin
-    medians of the unmasked pixels in the blue and red side windows, extrapolated to the overlap
-    centre. Returns (J, n_pix_blue, n_pix_red)."""
+def fit_mask(w, line_mask, extra=()):
+    """Pixels excluded from the side fits: lines + telluric bands + extra windows."""
+    lm = line_mask.copy()
+    for a, b in tuple(TELLURIC) + tuple(extra):
+        lm |= (w >= a) & (w <= b)
+    return lm
+
+
+def boundary_shape(w, y, overlap, blue, red, line_mask, lever=250.0, extra=()):
+    """Per-row continuum shape at the overlap from straight lines through the bin medians of the
+    unmasked pixels of the blue and red side windows (level a, slope b at the overlap centre x0):
+      J = (a_r - a_b) / level              fractional step at x0
+      K = (b_r - b_b) * lever / level      slope mismatch: divergence of the side lines `lever` A from x0
+      G = (b_b + b_r) / 2 * 100 / level    common gradient per 100 A
+    with level = (a_b + a_r) / 2. Returns dict(J, K, G, npix_blue, npix_red)."""
     with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
         warnings.simplefilter("ignore", RuntimeWarning)
-        lm = line_mask.copy()
-        for a, b in TELLURIC:
-            lm |= (w >= a) & (w <= b)
+        lm = fit_mask(w, line_mask, extra)
         mb = (w >= blue[0]) & (w <= blue[1]) & ~lm
         mr = (w >= red[0]) & (w <= red[1]) & ~lm
         x0 = 0.5 * (overlap[0] + overlap[1])
-        lb, lr = _side_fit(w, y, mb, x0), _side_fit(w, y, mr, x0)
-        J = (lr - lb) / (0.5 * (lr + lb))
-    return J, int(mb.sum()), int(mr.sum())
+        (ab, bb), (ar, br) = _side_line(w, y, mb, x0), _side_line(w, y, mr, x0)
+        lev = 0.5 * (ab + ar)
+        lev = np.where(lev > 0, lev, np.nan)
+        return dict(J=(ar - ab) / lev, K=(br - bb) * lever / lev, G=0.5 * (bb + br) * 100.0 / lev,
+                    npix_blue=int(mb.sum()), npix_red=int(mr.sum()))
+
+
+def boundary_jumps(w, y, overlap, blue, red, line_mask, extra=()):
+    """Per-row fractional continuum step at the overlap centre (see boundary_shape).
+    Returns (J, n_pix_blue, n_pix_red)."""
+    r = boundary_shape(w, y, overlap, blue, red, line_mask, extra=extra)
+    return r["J"], r["npix_blue"], r["npix_red"]
+
+
+def robust_median(v, min_n=5):
+    """(median, error of the median = 1.2533 * NMAD / sqrt(n), n) of the finite values."""
+    v = np.asarray(v, float)
+    v = v[np.isfinite(v)]
+    if v.size < min_n:
+        return np.nan, np.nan, int(v.size)
+    med = float(np.median(v))
+    return med, float(1.2533 * 1.4826 * np.median(np.abs(v - med)) / np.sqrt(v.size)), int(v.size)
+
+
+def classify(p, step, e_step, kink, e_kink, signal):
+    """Flag from the adopted step / slope mismatch (shared by compute() and lvmqa.recalc).
+    A component counts only if it exceeds its threshold AND nsig x its error. Returns (flag, note)."""
+    def level(x, ex, warn, major):
+        if not np.isfinite(x):
+            return 0
+        sig = not np.isfinite(ex) or abs(x) > p["nsig"] * ex
+        if not sig:
+            return 0
+        return 2 if abs(x) > major else (1 if abs(x) > warn else 0)
+
+    ls = level(step, e_step, p["step_warn"], p["step_major"])
+    lk = level(kink, e_kink, p["kink_warn"], p["kink_major"])
+    lvl = max(ls, lk)
+    parts = [f"step {step:+.1%}" + (f" +- {e_step:.1%}" if np.isfinite(e_step) else "")]
+    if np.isfinite(kink):
+        parts.append(f"slope mismatch {kink:+.1%} at +-{p['lever']:.0f} A" +
+                     (f" +- {e_kink:.1%}" if np.isfinite(e_kink) else ""))
+    note = ", ".join(parts) + f" ({signal})"
+    if lvl and ls == 0:
+        note += "; slope mismatch"
+    elif lvl and lk == 0:
+        note += "; step"
+    elif lvl:
+        note += "; step and slope mismatch"
+    if signal == "obs":
+        return (QAFlag.WARNING if lvl == 2 else QAFlag.GOOD), note + " (sky-dominated signal: at most WARNING)"
+    return (QAFlag.MAJOR, QAFlag.WARNING, QAFlag.GOOD)[2 - lvl], note
 
 
 def measure_steps(ctx, p):
@@ -177,11 +253,13 @@ def measure_steps(ctx, p):
         obs = np.where(good, f + sk, np.nan)
         Go = np.nanmedian(obs / np.nanmedian(obs, axis=1)[:, None], axis=0)
         lm_obs = line_mask_from(w, Go, p["mask_obs"])
-        Jo, nb, nr = boundary_jumps(w, obs, ov, blue, red, lm_obs)
-        out.update(J_obs=Jo, npix_blue=nb, npix_red=nr, stack_obs=Go, mask_obs=lm_obs)
+        extra = tuple(p.get("mask_windows", ()))
+        so = boundary_shape(w, obs, ov, blue, red, lm_obs, p.get("lever", 250.0), extra)
+        out.update(J_obs=so["J"], K_obs=so["K"], G_obs=so["G"], npix_blue=so["npix_blue"],
+                   npix_red=so["npix_red"], stack_obs=Go, mask_obs=lm_obs, extra_mask=extra)
         snr = np.nanmedian(np.where(good & ~lm_obs[None, :], f * np.sqrt(np.where(good, iv, 0.0)), np.nan), axis=1)
         src = snr >= p["min_snr_src"]
-        out["J_src"] = np.array([])
+        out["J_src"] = out["K_src"] = out["G_src"] = np.array([])
         if src.sum() >= 5:
             fs_ = np.where(good, f, np.nan)[src]
             norm = np.nanmedian(fs_, axis=1)[:, None]
@@ -191,9 +269,9 @@ def measure_steps(ctx, p):
             # residuals add noise) and emission lines in the source stack (> mask_src above its
             # envelope); independent of the source brightness (nebular fibers in bright HII fields)
             lm_src = line_mask_from(w, skyrel, p["mask_sky"]) | line_mask_from(w, Gs, p["mask_src"])
-            Js, nbs, nrs = boundary_jumps(w, fs_, ov, blue, red, lm_src)
-            out.update(J_src=Js, npix_blue_src=nbs, npix_red_src=nrs, stack_src=Gs, mask_src=lm_src,
-                       n_src_sel=int(src.sum()))
+            ss = boundary_shape(w, fs_, ov, blue, red, lm_src, p.get("lever", 250.0), extra)
+            out.update(J_src=ss["J"], K_src=ss["K"], G_src=ss["G"], npix_blue_src=ss["npix_blue"],
+                       npix_red_src=ss["npix_red"], stack_src=Gs, mask_src=lm_src, n_src_sel=int(src.sum()))
     return out
 
 
@@ -203,10 +281,20 @@ class _RelFluxBase(Metric):
     boundary = ""
     values = (
         ValueSpec("median_step", "f8", "", "Median fractional continuum step at the overlap (adopted signal)"),
+        ValueSpec("e_median_step", "f8", "", "Error of median_step (1.2533 NMAD / sqrt(n))"),
         ValueSpec("nmad_step", "f8", "", "NMAD of the per-fiber steps (adopted signal)"),
+        ValueSpec("median_kink", "f8", "", "Median slope mismatch: divergence of the side continua at +-lever A (fraction)"),
+        ValueSpec("e_median_kink", "f8", "", "Error of median_kink"),
+        ValueSpec("median_gradient", "f8", "", "Median common continuum gradient (fraction per 100 A)"),
         ValueSpec("signal", "U4", "", "Adopted signal: src (FLUX, fibers with continuum S/N >= 5) or obs (FLUX+SKY, all)"),
         ValueSpec("median_step_obs", "f8", "", "Median step, FLUX+SKY of all good science fibers"),
+        ValueSpec("e_median_step_obs", "f8", "", "Error of median_step_obs"),
+        ValueSpec("median_kink_obs", "f8", "", "Median slope mismatch, FLUX+SKY"),
+        ValueSpec("e_median_kink_obs", "f8", "", "Error of median_kink_obs"),
         ValueSpec("median_step_src", "f8", "", "Median step, FLUX of fibers with continuum S/N >= 5"),
+        ValueSpec("e_median_step_src", "f8", "", "Error of median_step_src"),
+        ValueSpec("median_kink_src", "f8", "", "Median slope mismatch, FLUX of fibers with continuum S/N >= 5"),
+        ValueSpec("e_median_kink_src", "f8", "", "Error of median_kink_src"),
         ValueSpec("n_src", "i8", "", "Fibers used for median_step_src"),
         ValueSpec("npix_blue", "i8", "", "Unmasked pixels blueward of the overlap (obs)"),
         ValueSpec("npix_red", "i8", "", "Unmasked pixels redward of the overlap (obs)"),
@@ -224,14 +312,16 @@ class _RelFluxBase(Metric):
     @property
     def criteria(self):  # type: ignore[override]
         p = self.params
+        msk = "".join(f", {a:.0f}-{b:.0f}" for a, b in p.get("mask_windows", ()))
         return {
-            "GOOD": (f"|median fractional continuum step at the {self.boundary} overlap "
-                     f"{p['overlap'][0]:.0f}-{p['overlap'][1]:.0f} A| <= {p['step_warn']:.0%} (straight lines through "
-                     f"10-A bin medians in {p['blue_side'][0]:.0f}-{p['blue_side'][1]:.0f} and "
-                     f"{p['red_side'][0]:.0f}-{p['red_side'][1]:.0f} A, lines/tellurics masked; FLUX of fibers with "
-                     f"S/N >= {p['min_snr_src']:g}, else FLUX+SKY of all fibers, then at most WARNING)"),
-            "WARNING": f"{p['step_warn']:.0%} < |median step| <= {p['step_major']:.0%}",
-            "MAJOR ISSUE": f"|median step| > {p['step_major']:.0%}",
+            "GOOD": (f"|step| <= {p['step_warn']:.0%} and |slope mismatch| <= {p['kink_warn']:.0%}, or not significant "
+                     f"(< {p['nsig']:g} sigma). Step = jump of the continuum at the {self.boundary} overlap centre, "
+                     f"slope mismatch = divergence of the two side continua {p['lever']:.0f} A from it; straight lines "
+                     f"through 10-A bin medians in {p['blue_side'][0]:.0f}-{p['blue_side'][1]:.0f} and "
+                     f"{p['red_side'][0]:.0f}-{p['red_side'][1]:.0f} A (lines, tellurics{msk} masked), medians over "
+                     f"fibers with S/N >= {p['min_snr_src']:g} (else FLUX+SKY of all fibers, then at most WARNING)"),
+            "WARNING": f"|step| > {p['step_warn']:.0%} or |slope mismatch| > {p['kink_warn']:.0%} (significant)",
+            "MAJOR ISSUE": f"|step| > {p['step_major']:.0%} or |slope mismatch| > {p['kink_major']:.0%} (significant)",
             "UNDEFINED": "SFrame missing or too few unmasked continuum pixels / fibers",
         }
 
@@ -262,36 +352,41 @@ class _RelFluxBase(Metric):
                     p95_abs_jump=float(np.percentile(np.abs(jump[fin]), 95)))
         # ---- v1.9 fractional continuum step
         r_ = measure_steps(ctx, p)
-        Jo, Js = r_["J_obs"], r_["J_src"]
         vals.update({k: r_[k] for k in ("npix_blue", "npix_red", "npix_blue_src", "npix_red_src") if k in r_})
         nb, nr = r_["npix_blue"], r_["npix_red"]
+        Jo, Js = r_["J_obs"], r_["J_src"]
         fo, fs = np.isfinite(Jo), np.isfinite(Js)
         if fo.sum() >= p["min_fibers"] and min(nb, nr) >= p["min_pix"]:
-            vals["median_step_obs"] = float(np.median(Jo[fo]))
+            m_, e_, _ = robust_median(Jo)
+            k_, ek_, _ = robust_median(r_["K_obs"])
+            vals.update(median_step_obs=m_, e_median_step_obs=e_, median_kink_obs=k_, e_median_kink_obs=ek_)
         if fs.sum() >= 5:
-            vals.update(median_step_src=float(np.median(Js[fs])), n_src=int(fs.sum()))
+            m_, e_, n_ = robust_median(Js)
+            k_, ek_, _ = robust_median(r_["K_src"])
+            vals.update(median_step_src=m_, e_median_step_src=e_, median_kink_src=k_, e_median_kink_src=ek_,
+                        n_src=n_)
         if fs.sum() >= p["min_src"]:
-            J, sig = Js[fs], "src"
+            J, K, G, sig = Js, r_["K_src"], r_["G_src"], "src"
         elif "median_step_obs" in vals and p["obs_fallback"]:
-            J, sig = Jo[fo], "obs"
+            J, K, G, sig = Jo, r_["K_obs"], r_["G_obs"], "obs"
         else:
             return self.result(QAFlag.UNDEFINED, note="too few continuum pixels / fibers", **vals)
-        med = float(np.median(J))
-        vals.update(median_step=med, nmad_step=float(1.4826 * np.median(np.abs(J - med))), signal=sig)
-        note = f"step {med:+.1%} ({sig})"
-        if sig == "obs":
-            flag = QAFlag.WARNING if abs(med) > p["step_major"] else QAFlag.GOOD
-            return self.result(flag, note=note + " (sky-dominated signal: at most WARNING)", **vals)
-        if abs(med) > p["step_major"]:
-            return self.result(QAFlag.MAJOR, note=note, **vals)
-        if abs(med) > p["step_warn"]:
-            return self.result(QAFlag.WARNING, note=note, **vals)
-        return self.result(QAFlag.GOOD, note=note, **vals)
+        med, e_med, _ = robust_median(J)
+        kin, e_kin, _ = robust_median(K)
+        gra = robust_median(G)[0]
+        Jf = J[np.isfinite(J)]
+        vals.update(median_step=med, e_median_step=e_med, nmad_step=float(1.4826 * np.median(np.abs(Jf - med))),
+                    median_kink=kin, e_median_kink=e_kin, median_gradient=gra, signal=sig)
+        flag, note = classify(p, med, e_med, kin, e_kin, sig)
+        return self.result(flag, note=note, **vals)
 
 
 _COMMON = dict(fit_margin=300.0, poly_order=2, clip_sigma=3.0, clip_iters=10,
                jump_warn=1.0, jump_bad=2.0, frac_warn_thresh=0.05, frac_bad_thresh=0.05,
                step_warn=0.03, step_major=0.08, min_snr_src=5.0, min_src=10, min_fibers=50, min_pix=40,
+               kink_warn=0.05, kink_major=0.10,  # slope mismatch (divergence of the side continua at +-lever A)
+               lever=250.0, nsig=3.0,            # lever arm [A]; significance of step / slope mismatch
+               mask_windows=(),                  # extra masked wavelength windows (A)
                mask_obs=0.10,   # obs: pixels > 10% above the running 20th percentile of the median spectrum
                mask_src=0.10,   # src: emission lines > 10% above the envelope of the source stack
                mask_sky=0.5,    # src: sky-line pixels (sky > 1.5 x its own continuum envelope)
@@ -323,4 +418,8 @@ class RelFluxRZ(_RelFluxBase):
                     # residuals); wider than b-r to keep enough continuum between the OH lines
                     # FLUX+SKY is biased by +0.2...+0.35 over these windows (sky-continuum shape):
                     # no fallback, UNDEFINED without bright fibers
-                    blue_side=(7180.0, 7520.0), red_side=(7740.0, 8100.0), **{**_COMMON, "obs_fallback": False})
+                    # v1.13: r side 6950-7520 A with 7040-7350 masked (H2O 7150-7350 is masked anyway; TiO
+                    # 7054 head, HeI 7065, [ArIII] 7136): 6950-7040 + 7350-7520 A, i.e. ~2.3x more pixels
+                    # and a longer lever arm than 7350-7520 A alone (slope errors halved)
+                    blue_side=(6950.0, 7520.0), red_side=(7740.0, 8100.0),
+                    **{**_COMMON, "obs_fallback": False, "mask_windows": ((7040.0, 7350.0),)})

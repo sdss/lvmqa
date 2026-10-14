@@ -207,12 +207,12 @@ def _ex_relflux(ctx, r, cls, key, metric):
         stack, lm, n = res["stack_src"], res["mask_src"].copy(), res.get("n_src_sel", 0)
     else:
         stack, lm, n = res["stack_obs"], res["mask_obs"].copy(), "all"
-    for a, b in rf.TELLURIC:
-        lm |= (w >= a) & (w <= b)
+    lm = rf.fit_mask(w, lm, pr.get("mask_windows", ()))
     x0 = 0.5 * (ov[0] + ov[1])
-    p = _panel(f"{key}: step {_f(r.get(f'relflux_{key}_median_step', np.nan)):+.1%} ({sig}, n={n}); "
-               f"obs {_f(r.get(f'relflux_{key}_median_step_obs', np.nan)):+.1%}, src "
-               f"{_f(r.get(f'relflux_{key}_median_step_src', np.nan)):+.1%}",
+    g = lambda k: _f(r.get(f"relflux_{key}_{k}", np.nan))  # noqa: E731
+    p = _panel(f"{key}: step {g('median_step'):+.1%}\u00b1{g('e_median_step'):.1%}, slope mismatch "
+               f"{g('median_kink'):+.1%}\u00b1{g('e_median_kink'):.1%} at \u00b1{pr['lever']:.0f} A\n"
+               f"({sig}, n={n}; common gradient {g('median_gradient'):+.1%}/100 A)",
                ylabel="median normalised flux (src: FLUX of bright fibers; obs: FLUX+SKY)")
     p["curves"].append((w, np.where(~lm, stack, np.nan), "unmasked pixels", dict(color="k", lw=0.6)))
     p["curves"].append((w, np.where(lm, stack, np.nan), "masked (lines, tellurics)", dict(color="0.78", lw=0.4)))
@@ -224,10 +224,13 @@ def _ex_relflux(ctx, r, cls, key, metric):
             yb = yb[0]
             c = np.polyfit(xb - x0, yb, 1)
             p["curves"].append((xb, yb, f"{lab}: 10-A bin medians", dict(color=col, ls="none", marker="o", ms=2.5)))
-            xx = np.array([min(xb.min(), x0), max(xb.max(), x0)])
-            yy = np.polyval(c, xx - x0)
-            p["curves"].append((xx, yy, f"{lab} fit", dict(color=col, lw=1.4)))
-            fits_y += list(yy) + list(yb)
+            # fit over its own side (solid) and extrapolated across the other side (dashed): a step
+            # shows as an offset at the overlap, a slope mismatch as diverging lines
+            xs = np.array([side[0], x0]) if side is blue else np.array([x0, side[1]])
+            xo = np.array([x0, red[1]]) if side is blue else np.array([blue[0], x0])
+            p["curves"].append((xs, np.polyval(c, xs - x0), f"{lab} fit", dict(color=col, lw=1.4)))
+            p["curves"].append((xo, np.polyval(c, xo - x0), None, dict(color=col, lw=0.9, ls="--")))
+            fits_y += list(np.polyval(c, xs - x0)) + list(yb)
     p["spans"] += [tuple(ov), (blue[0], blue[1], "#cfe0f5"), (red[0], red[1], "#f6d5d2")]
     # common y range 0.8-1.2, extended only if the fitted lines / bin medians fall outside
     lo, hi = 0.8, 1.2
@@ -757,15 +760,14 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
     exposure of each pointing in the shown regions), so the page stays cheap for large runs."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
-    from .metrics.dap_fluxmap import _halpha_map_job, halpha_map
+    from .metrics.dap_fluxmap import _halpha_map_job, halpha_map, has_halpha_map
     from .paths import dap_path
     coords = coords or {}
     cand, files = [], []
-    for row in qa:
-        f = dap_path(cfg, int(row["tileid"]), int(row["mjd"]), int(row["expnum"]))
-        if Path(f).is_file():
+    for row in qa:   # exposures with a DAP file or a cached Halpha map
+        if has_halpha_map(cfg, int(row["tileid"]), int(row["mjd"]), int(row["expnum"])):
             cand.append(row)
-            files.append(f)
+            files.append(dap_path(cfg, int(row["tileid"]), int(row["mjd"]), int(row["expnum"])))
     if not cand:
         return
 
@@ -867,7 +869,8 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
             lines = []
             for i in bad:
                 e = int(cand[i]["expnum"])
-                sv = _f(by[e]["fluxmap_s_dex"]) if e in by and "fluxmap_s_dex" in supl.colnames else np.nan
+                col = "fluxmap_local_dex" if "fluxmap_local_dex" in supl.colnames else "fluxmap_s_dex"
+                sv = _f(by[e][col]) if e in by and col in supl.colnames else np.nan
                 lines.append(f"{e} {sv:+.3f} {stat[i][:4]}")
             ax.text(ra_c + (float(np.median(ra0[bad])) - ra_c + 180.0) % 360.0 - 180.0, float(np.median(de0[bad])),
                     "\n".join(lines), ha="center", va="center", fontsize=5.5, color="k", family="monospace",
@@ -887,7 +890,7 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
         ax.axis("off")
     fig.legend(handles=[Line2D([], [], color=CCOL[c], lw=2, label=c) for c in flagged], loc="lower center",
                ncol=2, fontsize=7,
-               title="outline + label (expnum, s [dex]) = qa_fluxmap WARNING / MAJOR pointings only;  image = "
+               title="outline + label (expnum, local offset l [dex]) = qa_fluxmap WARNING / MAJOR pointings only;  image = "
                      "F(Halpha) [1e-16 erg/s/cm2] (DAP NP), mean of all overlapping fibers of all exposures; asinh "
                      "stretch, own scale per panel",
                title_fontsize=7, frameon=False)

@@ -55,6 +55,7 @@ class Node:
     dec: np.ndarray
     flux: np.ndarray
     eflux: np.ndarray
+    pa: float = 0.0   # IFU position angle (drpall sci_pa, deg): edge directions in the IFU frame
 
     @property
     def center(self):
@@ -118,14 +119,19 @@ def _nearest(A: np.ndarray, B: np.ndarray, chunk: int = 512):
 def build_edges(nodes: Sequence[Node], match_radius: float = 20.0, min_snr: float = 5.0,
                 max_sep_deg: float = 0.6, min_match: int = 10) -> List[Edge]:
     edges = []
-    for a, b in combinations(range(len(nodes)), 2):
-        (ra1, de1), (ra2, de2) = nodes[a].center, nodes[b].center
-        sep = np.hypot((ra1 - ra2) * np.cos(np.deg2rad(de1)), de1 - de2)
-        if sep > max_sep_deg:
-            continue
+    cen = np.array([n.center for n in nodes], float).reshape(-1, 2)   # once (nanmedian per node)
+    pairs = []
+    for a in range(len(nodes) - 1):           # candidate pairs, vectorised per row
+        dra = (cen[a + 1:, 0] - cen[a, 0] + 180.0) % 360.0 - 180.0
+        sep = np.hypot(dra * np.cos(np.deg2rad(cen[a, 1])), cen[a + 1:, 1] - cen[a, 1])
+        pairs += [(a, a + 1 + int(k)) for k in np.where(sep <= max_sep_deg)[0]]
+    for a, b in pairs:
+        (ra1, de1), (ra2, de2) = cen[a], cen[b]
         c = np.cos(np.deg2rad(0.5 * (de1 + de2)))
-        A = np.c_[nodes[a].ra * c * 3600.0, nodes[a].dec * 3600.0]
-        B = np.c_[nodes[b].ra * c * 3600.0, nodes[b].dec * 3600.0]
+        ua = (nodes[a].ra - ra1 + 180.0) % 360.0 - 180.0   # RA relative to node a (wrap-safe)
+        ub = (nodes[b].ra - ra1 + 180.0) % 360.0 - 180.0
+        A = np.c_[ua * c * 3600.0, nodes[a].dec * 3600.0]
+        B = np.c_[ub * c * 3600.0, nodes[b].dec * 3600.0]
         ga = np.isfinite(A).all(1)
         gb = np.isfinite(B).all(1)
         if not ga.any() or not gb.any():
@@ -163,89 +169,235 @@ def _lad(A: np.ndarray, d: np.ndarray, wt: np.ndarray, nit: int = 200, eps: floa
     return s
 
 
+def _components(n_nodes: int, edges: Sequence[Edge]) -> np.ndarray:
+    """Connected-component label per node (union-find); nodes without edges get their own label."""
+    parent = list(range(n_nodes))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for e in edges:
+        ra_, rb_ = find(e.i), find(e.j)
+        if ra_ != rb_:
+            parent[ra_] = rb_
+    roots = [find(a) for a in range(n_nodes)]
+    _, lab = np.unique(roots, return_inverse=True)
+    return lab
+
+
+def _tangent(centers: np.ndarray, idx: np.ndarray):
+    """Tangent-plane coordinates (deg) of the node centres idx around their median centre."""
+    ra, de = centers[idx, 0], centers[idx, 1]
+    r0, d0 = np.median(ra), np.median(de)
+    return ((ra - r0 + 180.0) % 360.0 - 180.0) * np.cos(np.deg2rad(d0)), de - d0
+
+
+def edge_directions(edges: Sequence[Edge], centers: np.ndarray, pa: Optional[np.ndarray] = None) -> np.ndarray:
+    """Direction of every edge i -> j (rad, east of north) in the IFU frame (sky PA minus the mean
+    sci_pa of the two exposures)."""
+    i = np.array([e.i for e in edges], int)
+    j = np.array([e.j for e in edges], int)
+    c = np.cos(np.deg2rad(0.5 * (centers[i, 1] + centers[j, 1])))
+    dra = (centers[j, 0] - centers[i, 0] + 180.0) % 360.0 - 180.0
+    th = np.arctan2(dra * c, centers[j, 1] - centers[i, 1])
+    if pa is not None:
+        th = th - np.deg2rad(0.5 * (pa[i] + pa[j]))
+    return th
+
+
 def solve(n_nodes: int, edges: Sequence[Edge], loss: str = "tukey", c: Optional[float] = None,
-          sigma_sys="auto", sys_floor: float = 0.005, lad_floor: float = 0.03,
-          nit: int = 100) -> Dict[str, np.ndarray]:
+          sigma_sys="auto", sys_floor: float = 0.005, lad_floor: float = 0.03, nit: int = 100,
+          centers: Optional[np.ndarray] = None, pa: Optional[np.ndarray] = None, pattern: str = "none",
+          pattern_min_nodes: int = 30, pattern_min_edges: int = 50) -> Dict[str, np.ndarray]:
     """
-    IRLS solution of d_ij = s_i - s_j with a robust loss; gauge: median(s) = 0.
-    sigma_sys='auto': the extra per-edge scatter (fiber-position mismatch, PSF, Halpha
-    gradients) is re-estimated in every iteration as the NMAD of the raw edge residuals of the
-    accepted edges (floor ``sys_floor`` dex) - the formal edge errors (~0.002 dex) are far too
-    small to standardise the residuals.
+    Robust solution of d_ij = s_i - s_j [+ a cos(theta_ij) + b sin(theta_ij)] on the overlap graph.
+
+    * Every connected component gets its own gauge (sum of s = 0; finally shifted to median 0).
+    * pattern = 'dipole' (or 'auto' with >= pattern_min_edges edges and a component of
+      >= pattern_min_nodes nodes): a common IFU-internal flux pattern, i.e. a dependence of the
+      edge offsets on the overlap direction theta_ij in the IFU frame (a flux gradient across the
+      IFU). On a mosaic such a pattern is exactly degenerate with a linear ramp of s across the
+      mosaic (the reason why the uncorrected solution of a large mosaic drifts by +-0.7 dex), so the
+      large components also get a "no linear trend of s" gauge: a large-scale linear trend of the
+      flux scale across a mosaic is attributed to the instrument, not to the exposures.
+      (A 3-fold term, e.g. spectrograph sectors, is not identifiable on a regular hexagonal mosaic:
+      it is degenerate with a 3-sublattice pattern of s.)
+    * Start: weighted L1 (IRLS), then Tukey (or Huber) IRLS on the standardised residuals.
+      sigma_sys='auto': extra per-edge scatter = NMAD of all raw edge residuals (floor sys_floor);
+      the formal edge errors (~0.002 dex) are far too small.
+    Returns dict(s, e_s, w, resid, A, sigma_sys, pattern (name), dipole (dex), dipole_pa (deg, IFU
+    frame: direction of the brighter IFU side), labels (components)).
     """
     E = len(edges)
     A = np.zeros((E, n_nodes))
-    d = np.array([e.d for e in edges])
-    sig_e = np.array([e.sigma for e in edges])
+    d = np.array([e.d for e in edges], float)
+    sig_e = np.array([e.sigma for e in edges], float)
     for k, e in enumerate(edges):
         A[k, e.i], A[k, e.j] = 1.0, -1.0
+    labels = _components(n_nodes, edges)
+    deg = np.abs(A).sum(axis=0)
+    comps = [np.where(labels == l_)[0] for l_ in np.unique(labels)]
+    big = [cmp for cmp in comps if len(cmp) >= pattern_min_nodes]
+    use_pat = (centers is not None and E > 0 and
+               (pattern == "dipole" or (pattern == "auto" and E >= pattern_min_edges and big)))
+    if use_pat:
+        th = edge_directions(edges, np.asarray(centers, float), None if pa is None else np.asarray(pa, float))
+        X = np.c_[np.cos(th), np.sin(th)]
+    else:
+        X = np.zeros((E, 0))
+    M = np.c_[A, X]
+    npar = M.shape[1]
+    G = []
+    for cmp in comps:
+        row = np.zeros(npar)
+        if len(cmp) == 1 or deg[cmp].sum() == 0:
+            row[cmp] = 1.0          # isolated node: s = 0
+            G.append(row)
+            continue
+        row[cmp] = 1.0
+        G.append(row)
+        if use_pat and len(cmp) >= pattern_min_nodes:
+            x, y = _tangent(np.asarray(centers, float), cmp)
+            for v in (x, y):
+                r_ = np.zeros(npar)
+                r_[cmp] = v
+                G.append(r_)
+    G = np.array(G) if G else np.zeros((0, npar))
     c = c if c is not None else (4.685 if loss == "tukey" else 1.345)
-    ssys = sys_floor if sigma_sys == "auto" else float(sigma_sys)
-    # robust start: weighted least-absolute-deviations (L1) solution of the graph (IRLS). L1 lets a minority of edges absorb the inconsistencies, so a corrupted edge
-    # is out-voted by the alternative paths (cycles) instead of pulling its nodes; starting
-    # the IRLS from least squares can converge to the wrong local minimum.
-    # nearly uniform L1 weights: the formal edge errors do not reflect the real edge scatter,
-    # and a well-measured corrupted edge must not out-weigh two independent paths
-    s = _lad(A, d, 1.0 / np.sqrt(sig_e ** 2 + lad_floor ** 2))
-    raw = d - A @ s
-    if sigma_sys == "auto":
-        ssys = max(1.4826 * float(np.median(np.abs(raw))), sys_floor)
-    sig = np.sqrt(sig_e ** 2 + ssys ** 2)
-    u = np.abs(raw / sig) / c
-    w = np.where(u < 1, (1 - u ** 2) ** 2, 0.0) if loss == "tukey" else np.where(u <= 1, 1.0, 1.0 / np.maximum(u, 1e-12))
-    for it in range(nit):
-        sig = np.sqrt(sig_e ** 2 + ssys ** 2)
-        W = w / sig ** 2
-        N = A.T @ (W[:, None] * A) + 1e-9 * np.eye(n_nodes)
-        s_new = np.linalg.solve(N, A.T @ (W * d))
-        raw = d - A @ s_new
-        if sigma_sys == "auto":
-            acc = w > 0.5 if (w > 0.5).sum() >= 3 else np.ones(E, bool)
-            ssys = max(1.4826 * float(np.median(np.abs(raw[acc]))), sys_floor)
-            sig = np.sqrt(sig_e ** 2 + ssys ** 2)
-        u = np.abs(raw / sig) / c
-        if loss == "tukey":
-            w_new = np.where(u < 1, (1 - u ** 2) ** 2, 0.0)
-        else:
-            w_new = np.where(u <= 1, 1.0, 1.0 / np.maximum(u, 1e-12))
-        done = np.allclose(s_new, s, atol=1e-6) and np.allclose(w_new, w, atol=1e-4)
-        s, w = s_new, w_new
+
+    def wls(W):
+        N = M.T @ (W[:, None] * M)
+        kap = 1e3 * max(float(np.max(np.diag(N))), 1.0)
+        N = N + kap * (G.T @ G)
+        return np.linalg.solve(N, M.T @ (W * d)), N
+
+    def nmad(r):
+        return 1.4826 * float(np.median(np.abs(r - np.median(r)))) if r.size else 0.0
+
+    # robust start: weighted L1 (IRLS) with nearly uniform weights - a minority of corrupted edges
+    # is out-voted by the alternative paths instead of pulling its nodes
+    wt = 1.0 / np.sqrt(sig_e ** 2 + lad_floor ** 2)
+    w1 = wt.copy()
+    x = np.zeros(npar)
+    for _ in range(200):
+        x_new, _ = wls(w1)
+        r = np.abs(d - M @ x_new)
+        w1 = wt / np.maximum(r, 1e-5)
+        done = np.max(np.abs(x_new - x)) < 1e-7
+        x = x_new
         if done:
             break
+    raw = d - M @ x
+    ssys = max(nmad(raw), sys_floor) if sigma_sys == "auto" else float(sigma_sys)
     sig = np.sqrt(sig_e ** 2 + ssys ** 2)
-    W = w / sig ** 2
-    N0 = A.T @ (W[:, None] * A)
+
+    def weights(raw, sig):
+        u = np.abs(raw / sig) / c
+        if loss == "tukey":
+            return np.where(u < 1, (1 - u ** 2) ** 2, 0.0)
+        return np.where(u <= 1, 1.0, 1.0 / np.maximum(u, 1e-12))
+
+    w = weights(raw, sig)
+    N = None
+    for _ in range(nit):
+        x_new, N = wls(w / sig ** 2)
+        raw = d - M @ x_new
+        if sigma_sys == "auto":
+            ssys = max(nmad(raw), sys_floor)   # all edges: NMAD is robust, no collapse to the floor
+        sig = np.sqrt(sig_e ** 2 + ssys ** 2)
+        w_new = weights(raw, sig)
+        done = np.allclose(x_new, x, atol=1e-6) and np.allclose(w_new, w, atol=1e-4)
+        x, w = x_new, w_new
+        if done:
+            break
+    if N is None:
+        x, N = wls(w / sig ** 2)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cov = np.linalg.pinv(N0)          # minimum-norm gauge (sum s = 0)
+        cov = np.linalg.pinv(N)
+    s = x[:n_nodes].copy()
     connected = (np.abs(A).T @ (w > 0.5)) > 0
-    s = s - np.median(s[connected]) if connected.any() else s
-    return dict(s=s, e_s=np.sqrt(np.abs(np.diag(cov))), w=w, resid=(d - A @ s) / sig, A=A,
-                sigma_sys=ssys)
+    for cmp in comps:                                   # median 0 per component
+        cc = cmp[connected[cmp]]
+        if cc.size:
+            s[cmp] -= np.median(s[cc])
+    member = np.zeros(n_nodes, bool)                    # nodes of the components the dipole was fitted on
+    if use_pat:
+        for cmp in big:
+            member[cmp] = True
+    out = dict(s=s, e_s=np.sqrt(np.abs(np.diag(cov)[:n_nodes])), w=w, resid=(d - M @ x) / sig, A=A,
+               sigma_sys=ssys, labels=labels, pattern="dipole" if use_pat else "none",
+               dipole=np.nan, dipole_pa=np.nan, e_dipole=np.nan, pattern_member=member)
+    if use_pat:
+        a_, b_ = x[n_nodes], x[n_nodes + 1]
+        out.update(dipole=float(np.hypot(a_, b_)), dipole_pa=float(np.degrees(np.arctan2(b_, a_)) % 360.0),
+                   e_dipole=float(np.sqrt(np.abs(cov[n_nodes, n_nodes] + cov[n_nodes + 1, n_nodes + 1]) / 2)))
+    return out
+
+
+def local_offsets(centers: np.ndarray, s: np.ndarray, e_s: np.ndarray, ok: np.ndarray,
+                  radius: float = 0.97, min_ref: int = 3):
+    """Offset of every node relative to its surroundings: l_i = s_i - median(s_j) over the other
+    connected nodes j whose centres lie within ``radius`` deg (default ~2 tile rings). Large-scale
+    structure of s (residual drifts of a big mosaic) cancels, single tiles and small groups of
+    offset tiles remain. With fewer than min_ref reference nodes l_i = s_i (small graphs).
+    Returns (l, e_l, n_ref)."""
+    centers = np.asarray(centers, float)
+    n = len(s)
+    loc, e_loc, n_ref = np.array(s, float), np.array(e_s, float), np.zeros(n, int)
+    for k in range(n):
+        if not ok[k]:
+            continue
+        c0 = np.cos(np.deg2rad(centers[k, 1]))
+        dra = (centers[:, 0] - centers[k, 0] + 180.0) % 360.0 - 180.0
+        dist = np.hypot(dra * c0, centers[:, 1] - centers[k, 1])
+        ref = ok & (dist <= radius)
+        ref[k] = False
+        n_ref[k] = int(ref.sum())
+        if n_ref[k] >= min_ref:
+            sr = s[ref]
+            med = float(np.median(sr))
+            e_ref = 1.2533 * 1.4826 * float(np.median(np.abs(sr - med))) / np.sqrt(sr.size)
+            loc[k] = s[k] - med
+            e_loc[k] = float(np.hypot(e_s[k], e_ref))
+    return loc, e_loc, n_ref
+
+
+def classify_node(local: float, e_local: float, n_edges: int, n_rejected: int,
+                  warn_dex: float = 0.04, major_dex: float = 0.10, nsig: float = 3.0) -> str:
+    """Flag label of one node from its local offset (shared by the metric and lvmqa.recalc)."""
+    if n_edges == 0:
+        return "UNDEFINED"
+    if n_rejected == n_edges:
+        return "WARNING"
+    sig = abs(local) > nsig * e_local
+    if abs(local) > major_dex and sig:
+        return "MAJOR ISSUE"
+    if (abs(local) > warn_dex and sig) or n_rejected > 0.5 * n_edges:
+        return "WARNING"
+    return "GOOD"
 
 
 def fluxmap(nodes: Sequence[Node], warn_dex: float = 0.04, major_dex: float = 0.10, nsig: float = 3.0,
-            **kw) -> FluxMapResult:
+            local_radius: float = 0.97, local_min: int = 3, **kw) -> FluxMapResult:
     ek = {k: kw.pop(k) for k in list(kw) if k in ("match_radius", "min_snr", "max_sep_deg", "min_match")}
     edges = build_edges(nodes, **ek)
-    sol = solve(len(nodes), edges, **kw)
+    centers = np.array([n.center for n in nodes])
+    sol = solve(len(nodes), edges, centers=centers, pa=np.array([n.pa for n in nodes]), **kw)
     A, w = sol["A"], sol["w"]
     n_edges = np.abs(A).sum(axis=0).astype(int)
     n_rej = (np.abs(A) * (w[:, None] < 0.5)).sum(axis=0).astype(int)
-    flags = []
-    for i in range(len(nodes)):
-        s, e = sol["s"][i], sol["e_s"][i]
-        if n_edges[i] == 0 or n_edges[i] == n_rej[i]:
-            flags.append("UNDEFINED" if n_edges[i] == 0 else "WARNING")
-        elif abs(s) > major_dex and abs(s) > nsig * e:
-            flags.append("MAJOR ISSUE")
-        elif (abs(s) > warn_dex and abs(s) > nsig * e) or n_rej[i] > 0.5 * n_edges[i]:
-            flags.append("WARNING")
-        else:
-            flags.append("GOOD")
+    loc, e_loc, n_ref = local_offsets(centers, sol["s"], sol["e_s"], n_edges > n_rej, local_radius, local_min)
+    flags = [classify_node(loc[i], e_loc[i], n_edges[i], n_rej[i], warn_dex, major_dex, nsig)
+             for i in range(len(nodes))]
     res = FluxMapResult([n.name for n in nodes], sol["s"], sol["e_s"], edges, w, sol["resid"],
                         n_edges, n_rej, flags)
     res.sigma_sys = sol["sigma_sys"]
+    res.local, res.e_local, res.n_ref = loc, e_loc, n_ref
+    res.pattern, res.dipole, res.dipole_pa = sol["pattern"], sol["dipole"], sol["dipole_pa"]
     return res
 
 

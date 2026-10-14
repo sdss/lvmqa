@@ -141,12 +141,21 @@ def process_exposure(cfg: PipelineConfig, row: Dict[str, Any],
 def finalize_records(records: List[Dict[str, Any]], metrics: List[Metric], cfg: PipelineConfig,
                      drpall: Table) -> None:
     """Main process: multi-exposure metrics (from the collected payloads), then summaries."""
+    import inspect
     by_exp = {r["expnum"]: r for r in records}
-    for m in [m for m in metrics if m.multi]:
+    multi = [m for m in metrics if m.multi]
+    # metrics that use results of other multi-exposure metrics (``multi_after``) run after them;
+    # results are exchanged through ``shared`` (e.g. qa_fluxmap -> qa_gradient: IFU dipole)
+    multi.sort(key=lambda m: len(tuple(getattr(m, "multi_after", ()))))
+    shared: Dict[str, Any] = {}
+    for m in multi:
         t0 = time.perf_counter()
         payloads = {e: r.get("payloads", {}).get(m.name) for e, r in by_exp.items()}
         try:
-            res = m.compute_multi(payloads, cfg, drpall)
+            if "shared" in inspect.signature(m.compute_multi).parameters:
+                res = m.compute_multi(payloads, cfg, drpall, shared=shared)
+            else:
+                res = m.compute_multi(payloads, cfg, drpall)
         except Exception as exc:  # noqa: BLE001
             import traceback
             log.error("%s failed: %s\n%s", m.name, exc, traceback.format_exc())

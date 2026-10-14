@@ -89,8 +89,8 @@ def _make(name, slot, title, description, components, needs=("dap", "dap_output"
 _make("qa_line_fluxes", 21, "Emission-line fluxes (summary)",
       "Reliability of emission-line fluxes, maps and line ratios",
       {"qa_fit_consistency": "hard", "qa_dap_pmfit": "hard", "qa_dap_npfluxes": "hard",
-       "qa_lineratios": "hard", "qa_fluxmap": "hard", "qa_relflux_br": "hard", "qa_relflux_rz": "hard",
-       "qa_absflux": "soft", "qa_skyline_sub": "soft", "qa_skycont_sub": "soft",
+       "qa_lineratios": "hard", "qa_fluxmap": "hard", "qa_gradient": "hard", "qa_relflux_br": "hard",
+       "qa_relflux_rz": "hard", "qa_absflux": "soft", "qa_skyline_sub": "soft", "qa_skycont_sub": "soft",
        "qa_flatfield": "soft", "qa_telluric": "soft", "qa_incomplete": "hard"})
 _make("qa_kinematics", 22, "Kinematics (summary)",
       "Reliability of gas and stellar velocities and velocity dispersions",
@@ -99,14 +99,14 @@ _make("qa_kinematics", 22, "Kinematics (summary)",
       needs=("dap",))
 _make("qa_stars", 23, "Stellar continuum (summary)",
       "Reliability of the stellar continuum and stellar-population analysis",
-      {"qa_absorption": "soft", "qa_starkinematics": "hard", "qa_absflux": "hard",
+      {"qa_absorption": "soft", "qa_starkinematics": "hard", "qa_absflux": "hard", "qa_gradient": "soft",
        "qa_relflux_br": "hard", "qa_relflux_rz": "hard", "qa_skycont_sub": "hard",
        "qa_telluric": "soft", "qa_flatfield": "soft", "qa_incomplete": "hard"},
       needs=("dap",))
 _make("qa_abs_calibration", 24, "Flux calibration (summary)",
       "Absolute and relative flux calibration",
       {"qa_absflux": "hard", "qa_relflux_br": "hard", "qa_relflux_rz": "hard",
-       "qa_telluric": "hard", "qa_fluxmap": "hard", "qa_flatfield": "soft"})
+       "qa_telluric": "hard", "qa_fluxmap": "hard", "qa_gradient": "hard", "qa_flatfield": "soft"})
 _make("qa_general_drp", 25, "General DRP (summary)",
       "Instrument and data-reduction integrity",
       {"qa_incomplete": "hard", "qa_flatfield": "hard", "qa_skyline_sub": "hard",

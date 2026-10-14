@@ -21,5 +21,8 @@ lvmqa = "lvmqa.cli:main"
 [tool.setuptools.dynamic]
 version = {attr = "lvmqa.__version__"}
 
+[tool.setuptools.package-data]
+lvmqa = ["data/*.npz"]
+
 [tool.setuptools.packages.find]
 include = ["lvmqa*"]

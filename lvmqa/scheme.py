@@ -33,10 +33,12 @@ MEAS = {
                       "dev.>{major_dev_oiii:g}/{major_dev_nii:g}/{major_dev_siii:g}%; Balmer>{balmer_major_frac:.0%}"),
     "qa_absflux": ("MOD vs SCI flux calibration per channel (z-score)",
                    ">{z_thresh:g}σ in 1 channel", ">{z_thresh:g}σ in ≥{n_major} ch.; no MOD / fluxcal"),
-    "qa_relflux_br": ("continuum step at the b/r overlap (10-Å binned medians, source fibers)",
-                      "|step|>{step_warn:.0%}", "|step|>{step_major:.0%}"),
-    "qa_relflux_rz": ("continuum step at the r/z overlap (10-Å binned medians, source fibers)",
-                      "|step|>{step_warn:.0%}", "|step|>{step_major:.0%}"),
+    "qa_relflux_br": ("continuum step + slope mismatch at the b/r overlap (side line fits, source fibers)",
+                      "|step|>{step_warn:.0%} or |kink|>{kink_warn:.0%} ({nsig:g}σ)",
+                      "|step|>{step_major:.0%} or |kink|>{kink_major:.0%} ({nsig:g}σ)"),
+    "qa_relflux_rz": ("continuum step + slope mismatch at the r/z overlap (side line fits, source fibers)",
+                      "|step|>{step_warn:.0%} or |kink|>{kink_warn:.0%} ({nsig:g}σ)",
+                      "|step|>{step_major:.0%} or |kink|>{kink_major:.0%} ({nsig:g}σ)"),
     "qa_skyline_sub": ("residual / sky flux of OI5577, OH6865, NaD, O2 per spectrograph",
                        "|res/sky|>{warn_any:g} in any", ">{bad_all_lines:g} in all, or >{bad_any:g} in any"),
     "qa_skycont_sub": ("continuum floor of the faintest fibers in inter-line windows (S/N units)",
@@ -67,8 +69,10 @@ MEAS = {
     "qa_absorption": ("absorption indices: data vs DAP stellar model (ΔI)",
                       "1 feat. |ΔI|>{tol_major:g} Å, or >{frac_poor_warn:.0%} >{tol_warn:g} Å",
                       "≥{frac_bad_major:.0%} feat. |ΔI|>{tol_major:g} Å"),
-    "qa_fluxmap": ("Hα flux-scale offset s vs overlapping tiles (multi-exposure fit)",
-                   "|s|>{warn_dex:g} dex", "|s|>{major_dex:g} dex"),
+    "qa_fluxmap": ("Hα flux-scale offset vs tiles within {local_radius:g}° (overlap graph, IFU dipole fitted)",
+                   "|l|>{warn_dex:g} dex ({nsig:g}σ)", "|l|>{major_dex:g} dex ({nsig:g}σ)"),
+    "qa_gradient": ("Hα jumps across spectrograph sector boundaries; mosaic IFU dipole",
+                    "spread or dipole>{warn_dex:g} dex ({nsig:g}σ)", "spread or dipole>{major_dex:g} dex"),
     "qa_starkinematics": ("stellar v / σ outliers in connected regions; degenerate σ; v★ − v(Hα)",
                           ">{frac_warn:.0%} outl.; degenerate; |Δv|>{dv_gas:g}", ">{frac_major:.0%} outliers"),
     "qa_status": ("detected emission lines / stellar continuum (booleans, information only)", "–", "–"),
@@ -214,6 +218,7 @@ def draw_scheme(out, metric_options=None):
                 family="monospace")
         meas, tw, tm = MEAS.get(n, (getattr(m, "title", ""), "", ""))
         opts = dict(m.params)
+        meas = _fmt(meas, opts)
         ax.text(x_meas + 0.05, y + rh / 2, meas, ha="left", va="center", fontsize=6.4)
         ax.text(x_warn + 0.05, y + rh / 2, _fmt(tw, opts), ha="left", va="center", fontsize=6.4, color="#8a5d00")
         ax.text(x_maj + 0.05, y + rh / 2, _fmt(tm, opts), ha="left", va="center", fontsize=6.4,

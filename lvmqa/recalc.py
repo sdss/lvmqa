@@ -205,28 +205,28 @@ def _absflux(m, v, flag, note):
     return G, "", {"n_outliers": 0}
 
 
-@classifier("qa_relflux_br", "qa_relflux_rz", params=("step_warn", "step_major", "min_src", "obs_fallback"))
+@classifier("qa_relflux_br", "qa_relflux_rz",
+            params=("step_warn", "step_major", "kink_warn", "kink_major", "nsig", "min_src", "obs_fallback"))
 def _relflux(m, v, flag, note):
+    from .metrics.drp_relflux import classify
     p = m.params
     src, obs = _f(v.get("median_step_src")), _f(v.get("median_step_obs"))
     if not (_ok(src) or _ok(obs)):
         return None
+    if "e_median_step_src" not in v and "e_median_step_obs" not in v:
+        return None  # run made before v1.13 (no errors / slope mismatch): keep the stored flag
     n_src = _f(v.get("n_src"))
     if _ok(src) and n_src >= p["min_src"]:
-        med, sig = src, "src"
+        sig = "src"
     elif _ok(obs) and p["obs_fallback"]:
-        med, sig = obs, "obs"
+        sig = "obs"
     else:
         return U, "too few continuum pixels / fibers", {}
-    upd = {"median_step": med, "signal": sig}
-    nt = f"step {med:+.1%} ({sig})"
-    if sig == "obs":
-        return (W if abs(med) > p["step_major"] else G), nt + " (sky-dominated signal: at most WARNING)", upd
-    if abs(med) > p["step_major"]:
-        return M, nt, upd
-    if abs(med) > p["step_warn"]:
-        return W, nt, upd
-    return G, nt, upd
+    med, e_med = _f(v.get(f"median_step_{sig}")), _f(v.get(f"e_median_step_{sig}"))
+    kin, e_kin = _f(v.get(f"median_kink_{sig}")), _f(v.get(f"e_median_kink_{sig}"))
+    upd = {"median_step": med, "e_median_step": e_med, "median_kink": kin, "e_median_kink": e_kin, "signal": sig}
+    fl, nt = classify(p, med, e_med, kin, e_kin, sig)
+    return fl, nt, upd
 
 
 @classifier("qa_skyline_sub", params=("bad_all_lines", "bad_any", "warn_any"))
@@ -532,20 +532,30 @@ def _absorption(m, v, flag, note):
 
 @classifier("qa_fluxmap", params=("warn_dex", "major_dex", "nsig"))
 def _fluxmap(m, v, flag, note):
+    from .metrics.dap_fluxmap import _note
+    from .multitile.fluxmap import classify_node
     p = m.params
     s, es = _f(v.get("s_dex")), _f(v.get("e_s_dex"))
+    loc, el = _f(v.get("local_dex")), _f(v.get("e_local_dex"))
     ne, nr = _f(v.get("n_edges")), _f(v.get("n_rejected"))
     if not _ok(s) or not (ne > 0):
         return None
-    nt = f"s = {s:+.3f} dex ({10 ** s:.2f}x), {int(nr)}/{int(ne)} overlaps rejected"
-    sig = abs(s) > p["nsig"] * es
-    if nr == ne:
-        return W, nt, {}
-    if abs(s) > p["major_dex"] and sig:
-        return M, nt, {}
-    if (abs(s) > p["warn_dex"] and sig) or nr > 0.5 * ne:
-        return W, nt, {}
-    return G, "", {}
+    if not _ok(loc):          # run made before v1.13: global offset s
+        loc, el = s, es
+    lab = classify_node(loc, el, int(ne), int(nr), p["warn_dex"], p["major_dex"], p["nsig"])
+    fl = {"GOOD": G, "WARNING": W, "MAJOR ISSUE": M}[lab]
+    nt = "" if fl == G else _note(loc, _f(v.get("n_local")) if _ok(_f(v.get("n_local"))) else 0,
+                                  m.params["local_radius"], s, nr, ne)
+    return fl, nt, {}
+
+
+@classifier("qa_gradient", params=("warn_dex", "major_dex", "nsig", "use_dipole"))
+def _gradient(m, v, flag, note):
+    from .metrics.dap_gradient import classify
+    sp, dp = _f(v.get("spread_dex")), _f(v.get("ifu_dipole_dex"))
+    if not (_ok(sp) or _ok(dp)):
+        return None
+    return (*classify(m.params, sp, _f(v.get("e_spread_dex")), dp, _f(v.get("e_ifu_dipole_dex"))), {})
 
 
 @classifier("qa_starkinematics", params=("frac_warn", "frac_major", "dv_gas"))

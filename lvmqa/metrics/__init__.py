@@ -61,4 +61,5 @@ from . import dap_gaskinematics  # noqa: F401
 from . import dap_absorption  # noqa: F401
 from . import dap_starkinematics  # noqa: F401
 from . import dap_fluxmap  # noqa: F401
+from . import dap_gradient  # noqa: F401
 from . import status  # noqa: F401
