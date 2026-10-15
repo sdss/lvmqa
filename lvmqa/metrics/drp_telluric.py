@@ -17,10 +17,12 @@ Method per band:
    straight line through its medians in the two continuum windows (removes a smooth model
    offset, e.g. where the DAP fit is masked: 8250-10000 A). The stellar templates contain no
    tellurics, so stellar features (TiO bands of cool stars, Paschen lines) cancel.
-2. If (1) is not available or gives |EW| > ew_warn, the local interpolation is also computed
-   (FLUX / straight line through the continuum windows in the brightest-continuum fibers, the
-   v1.6 method) and adopted if it gives the smaller |EW| (the DAP model may be wrong). Both EWs
-   are reported (ew_dap_*, ew_interp_*); ``method`` gives the adopted one (n / s).
+2. The local interpolation (FLUX / straight line through the continuum windows in the
+   brightest-continuum fibers, the v1.6 method) is always computed (v1.15) and adopted if (1)
+   is not available, or if (1) gives |EW| > ew_warn and the interpolation the smaller |EW| (the
+   DAP model may be wrong). Both EWs are reported (ew_dap_*, ew_interp_*; NaN only if the
+   method is not applicable: no DAP output / too few bright fibers); ``method`` gives the
+   adopted one (n / s).
 The per-fiber normalised spectra are median-stacked; pixels at bright sky lines
 (sky > 0.3 x continuum) are excluded.
 
@@ -165,8 +167,8 @@ class Telluric(Metric):
             return None
         sel = sel[np.argsort(snr[sel])[::-1][:p["max_fibers"]]]
         wave, planes = ctx.dap_output(f"tell_{b}")
-        _, sky = ctx.dap_sframe_window("SKY", wave[0], wave[-1])
-        sky = sky[sel][:, :wave.size]
+        from ._dapout import sframe_on
+        sky = sframe_on(ctx, "SKY", wave)[sel]
         data = planes[NOGAS][sel].astype(float)
         if p["dap_model"] == "stellar":
             cont = planes[MODEL][sel].astype(float)
@@ -222,14 +224,14 @@ class Telluric(Metric):
             r, m = rd, "n"
             if rd is not None:
                 vals[f"ew_dap_{b}"] = rd["ew"]
-            if rd is None or abs(rd["ew"]) > p["ew_warn"]:
-                # the DAP fit may be wrong (e.g. masked fit range): check the local interpolation
-                # and adopt it if it gives the smaller |EW|
-                rs = self._band(ctx, rows, band, cl, cr)
-                if rs is not None:
-                    vals[f"ew_interp_{b}"] = rs["ew"]
-                    if rd is None or abs(rs["ew"]) < abs(rd["ew"]):
-                        r, m = rs, "s"
+            # local interpolation: always measured and reported (v1.15); adopted if the DAP method
+            # is unavailable or gives |EW| > ew_warn while the interpolation gives the smaller |EW|
+            # (the DAP fit may be wrong, e.g. masked fit range)
+            rs = self._band(ctx, rows, band, cl, cr)
+            if rs is not None:
+                vals[f"ew_interp_{b}"] = rs["ew"]
+                if rd is None or (abs(rd["ew"]) > p["ew_warn"] and abs(rs["ew"]) < abs(rd["ew"])):
+                    r, m = rs, "s"
             used.append(f"{b}:{m}" if r is not None else f"{b}:-")
             if r is None:
                 vals[f"n_{b}"] = 0

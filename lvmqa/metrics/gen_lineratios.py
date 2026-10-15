@@ -14,10 +14,16 @@ siii : [SIII] 9531/9069  vs 2.47, reddened per fiber with E(B-V) from Halpha/Hbe
        (intrinsic 2.86, CCM89, R_V=3.1; Halpha/Hbeta < 2.86 -> A_V = 0)
        -> statistic: median(R_obs / R_expected) - 1; flagged if larger than the
           threshold AND significant (> nsig_median x error of the median)
+       v1.15: if the extinction-corrected ratio is LOW by more than the MAJOR threshold but
+       the uncorrected ratio agrees with 2.47 (sub-test GOOD), the sub-test is softened to
+       WARNING (the Ha/Hb-based reddening, not the [SIII] lines, is then the likely culprit:
+       e.g. Hbeta affected by stellar absorption or a blue flux-calibration error)
 hahb : Halpha/Hbeta vs 2.86  }  fraction of fibers whose ratio is below the intrinsic
 hbhg : Hbeta/Hgamma vs 2.14  }  Case-B value by more than ``balmer_nsigma`` sigma
 
-The metric flag is the worst flag over the sub-tests that could be evaluated.
+A sub-test is evaluated only with >= ``min_fibers`` (30, v1.15) fibers where all its lines
+have S/N > ``min_snr``; otherwise it is ignored. The metric flag is the worst flag over the
+sub-tests that could be evaluated (UNDEFINED if none).
 """
 
 from __future__ import annotations
@@ -54,6 +60,8 @@ def _values():
         v.append(ValueSpec(f"{t}_n", "i8", "", f"{t}: fibers used"))
         v.append(ValueSpec(f"{t}_dev", "f8", "percent", f"{t}: median(R_obs/R_expected) - 1"))
         v.append(ValueSpec(f"{t}_e_dev", "f8", "percent", f"{t}: uncertainty of the median deviation"))
+    v.append(ValueSpec("siii_dev_raw", "f8", "percent", "siii: median(R_obs / 2.47) - 1 (no extinction correction)"))
+    v.append(ValueSpec("siii_e_dev_raw", "f8", "percent", "siii: uncertainty of siii_dev_raw"))
     v.append(ValueSpec("siii_expratio", "f8", "", "Median expected (reddened) [SIII] 9531/9069"))
     v.append(ValueSpec("av_med", "f8", "mag", "Median A_V from Halpha/Hbeta of fibers in the siii test"))
     for t in BALMER:
@@ -76,7 +84,8 @@ class LineRatios(Metric):
     requires = ("dap",)
     defaults = dict(
         min_snr=10.0,                # all lines of a sub-test must have S/N above this
-        min_fibers=5,                # minimum number of fibers for a sub-test verdict
+        min_fibers=30,               # minimum number of fibers for a sub-test verdict (else ignored)
+        siii_soften=True,            # MAJOR (corrected ratio too low) -> WARNING if the raw ratio agrees
         ratio_oiii=2.98, ratio_nii=2.96, ratio_siii=2.47,
         ratio_hahb=2.86, ratio_hbhg=2.137,
         warn_dev_oiii=10.0, major_dev_oiii=20.0,   # |median deviation| [percent]
@@ -100,7 +109,9 @@ class LineRatios(Metric):
                         f"extinction-corrected) and > {p['nsig_median']:g} sigma; or > "
                         f"{p['balmer_warn_frac']:.0%} of fibers with Ha/Hb or Hb/Hg below Case B "
                         f"by > {p['balmer_nsigma']:g} sigma. Non-parametric fluxes, fibers with "
-                        f"S/N > {p['min_snr']:g} in all lines of the sub-test, >= {p['min_fibers']} fibers"),
+                        f"S/N > {p['min_snr']:g} in all lines of the sub-test, >= {p['min_fibers']} fibers "
+                        f"(else the sub-test is ignored). [SIII] too low (MAJOR) but uncorrected ratio "
+                        f"consistent with theory -> WARNING"),
             "MAJOR ISSUE": (f"Same, with doublet |median dev| > {p['major_dev_oiii']:g}% / "
                             f"{p['major_dev_nii']:g}% / {p['major_dev_siii']:g}%, or Balmer "
                             f"fraction > {p['balmer_major_frac']:.0%}"),
@@ -138,6 +149,16 @@ class LineRatios(Metric):
             return QAFlag.WARNING
         return QAFlag.GOOD
 
+    def siii_soften(self, flag, n, dev_pct, dev_raw_pct, e_raw_pct):
+        """[SIII]: MAJOR because the extinction-corrected ratio is too LOW, but the uncorrected
+        ratio agrees with theory -> WARNING (returns (flag, softened?))."""
+        p = self.params
+        if (p["siii_soften"] and flag == QAFlag.MAJOR and np.isfinite(dev_pct) and dev_pct < -p["major_dev_siii"]
+                and np.isfinite(dev_raw_pct) and np.isfinite(e_raw_pct)
+                and self.doublet_classify("siii", n, dev_raw_pct, e_raw_pct) == QAFlag.GOOD):
+            return QAFlag.WARNING, True
+        return flag, False
+
     def _doublet_flag(self, test, y):
         """y = R_obs / R_expected per fiber -> (flag, n, deviation in percent)."""
         p = self.params
@@ -173,6 +194,7 @@ class LineRatios(Metric):
         fl = self._fluxes(ctx)
         vals = {}
         sub = {}
+        softened = False
         k_9069, k_9531 = k_lambda([9069.0, 9531.1], p["rv"], p["extinction_law"])
         for test, (num, den) in DOUBLETS.items():
             keys = [num, den] + (["ha", "hb"] if test == "siii" else [])
@@ -189,6 +211,14 @@ class LineRatios(Metric):
             self._last_err = np.nan
             sub[test], vals[f"{test}_n"], vals[f"{test}_dev"] = self._doublet_flag(test, r / expected)
             vals[f"{test}_e_dev"] = self._last_err
+            if test == "siii" and r.size >= p["min_fibers"]:
+                yr = r / p["ratio_siii"]
+                vals["siii_dev_raw"] = float(100 * (np.median(yr) - 1.0))
+                vals["siii_e_dev_raw"] = float(100 * 1.2533 * _nmad(yr) / np.sqrt(yr.size))
+                sub[test], soft = self.siii_soften(sub[test], vals["siii_n"], vals["siii_dev"],
+                                                   vals["siii_dev_raw"], vals["siii_e_dev_raw"])
+                if soft:
+                    softened = True
 
         for test, (num, den) in BALMER.items():
             ok = self._good(fl, [num, den])
@@ -208,4 +238,6 @@ class LineRatios(Metric):
         worst = max(defined.values(), key=lambda f: _SEV[f])
         bad = [t for t, f in defined.items() if f != QAFlag.GOOD]
         note = ("issues: " + ", ".join(f"{t}={defined[t].name}" for t in bad)) if bad else ""
+        if softened:
+            note += " (siii softened: uncorrected ratio consistent, Ha/Hb reddening suspect)"
         return self.result(worst, note=note, **vals)

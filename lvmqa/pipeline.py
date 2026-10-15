@@ -77,6 +77,23 @@ def select_exposures(drpall: Table, expnums: Optional[Iterable[int]] = None,
     return out
 
 
+def sframes_exist(cfg: PipelineConfig, rows: Table, nthreads: int = 16) -> np.ndarray:
+    """Boolean mask: SFrame file on disk, one stat per exposure (no DAP lookup), run in threads:
+    on network file systems the latency of each stat, not the CPU, dominates."""
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    from .paths import sframe_path, tile_group
+    tg = np.asarray(rows["tilegrp"]).astype(str) if "tilegrp" in rows.colnames else None
+    paths = []
+    for k, (t, m, e) in enumerate(zip(np.asarray(rows["tileid"]), np.asarray(rows["mjd"]), np.asarray(rows["expnum"]))):
+        g = tg[k].strip() if tg is not None and tg[k].strip() else tile_group(int(t))
+        paths.append(str(sframe_path(cfg, int(t), int(m), int(e), g)))
+    if len(paths) < 50 or nthreads <= 1:
+        return np.array([os.path.isfile(f) for f in paths], dtype=bool)
+    with ThreadPoolExecutor(max_workers=min(int(nthreads), 64)) as ex:
+        return np.fromiter(ex.map(os.path.isfile, paths, chunksize=32), dtype=bool, count=len(paths))
+
+
 def _row_to_dict(row) -> Dict[str, Any]:
     d = {}
     for c in row.colnames:
@@ -287,7 +304,8 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
            existing_only: bool = False,
            nproc: int = 1,
            write: bool = True, html: bool = True, tag: Optional[str] = None,
-           pdf: bool = True, pdf_n: int = 5, pdf_seed: int = 1,
+           pdf: bool = True, pdf_n: int = 5, pdf_seed: int = 1, xlsx: bool = False,
+           html_detail: Optional[bool] = None,
            ) -> QAResult:
     """
     Run the QA pipeline.
@@ -304,6 +322,7 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     nproc                    : number of worker processes.
     write, html              : write FITS+XLSX (and HTML report) to ``output_dir``.
     tag                      : optional suffix for output file names.
+    xlsx                     : also write the XLSX copies of the FITS tables (slow for large runs)
     pdf, pdf_n, pdf_seed     : write the diagnostics PDF (<base>_diagnostics.pdf; up to pdf_n random
                                exposures per status and metric) after the tables (needs write).
     """
@@ -323,8 +342,11 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     drpall = load_drpall(cfg)
     rows = select_exposures(drpall, expnums, mjds, tileids)
     if existing_only and len(rows):
-        keep = [ExposureContext(cfg, _row_to_dict(r)).has_sframe for r in rows]
-        rows = rows[np.asarray(keep, dtype=bool)]
+        t_ex = time.time()
+        n0 = len(rows)
+        rows = rows[sframes_exist(cfg, rows, nthreads=max(16, 2 * nproc))]
+        log.info("--existing-only: %d of %d SFrames on disk (checked in %.1f s)", len(rows), n0,
+                 time.time() - t_ex)
     log.info("%d exposure(s) selected (drpall: %d rows)", len(rows), len(drpall))
 
     for m in mlist:
@@ -350,19 +372,23 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     finalize_records(records, mlist, cfg, drpall)
     table = build_table(rows, records, mlist, cfg)
     selection = {"expnums": list(expnums or []), "mjds": list(mjds or []),
-                 "tileids": list(tileids or []), "existing_only": existing_only}
+                 "tileids": list(tileids or []), "existing_only": existing_only}   # report: shown as ranges
     result = QAResult(table=table, metrics=mlist, config=cfg, selection=selection,
                       nproc=nproc)
     table.meta["RUNTIME"] = round(time.time() - t_start, 1)
 
     if write:
         from .output import write_outputs
-        result.files.update(write_outputs(result, tag))
+        t_w = time.time()
+        result.files.update(write_outputs(result, tag, xlsx=xlsx))
+        log.info("tables written in %.1f s%s", time.time() - t_w, "" if xlsx else " (no XLSX; --xlsx to add)")
         if html:
             from .output import output_basename
             base = Path(cfg.output_dir) / output_basename(cfg, tag)
             from .report import write_html
-            result.files["html"] = write_html(result, Path(f"{base}.html"))
+            t_w = time.time()
+            result.files["html"] = write_html(result, Path(f"{base}.html"), detail=html_detail)
+            log.info("HTML report written in %.1f s", time.time() - t_w)
         if pdf and len(table):
             from .diagnostics import make_pdf
             t_pdf = time.time()

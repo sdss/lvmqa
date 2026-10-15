@@ -38,6 +38,73 @@ def sigma_window(ctx, w0: float, w1: float) -> Tuple[np.ndarray, np.ndarray]:
     return w, sig
 
 
+def sframe_on(ctx, ext: str, wave: np.ndarray) -> np.ndarray:
+    """SFrame extension ``ext`` for the PT fibers on the DAP-output wavelength grid ``wave``
+    (nearest pixel; NaN where no SFrame pixel lies within half a pixel). Safer than slicing the
+    SFrame window to the same length: the two windows can differ by a pixel at the edges."""
+    wave = np.asarray(wave, float)
+    dw = float(np.median(np.diff(wave))) if wave.size > 1 else 1.0
+    w, d = ctx.dap_sframe_window(ext, wave[0] - 2 * dw, wave[-1] + 2 * dw)
+    if w.size == 0:
+        return np.full((d.shape[0], wave.size), np.nan)
+    j = np.clip(np.searchsorted(w, wave), 1, max(w.size - 1, 1)) if w.size > 1 else np.zeros(wave.size, int)
+    if w.size > 1:
+        j = np.where(np.abs(w[j - 1] - wave) < np.abs(w[j] - wave), j - 1, j)
+    out = np.array(d[:, j], dtype=float)
+    out[:, np.abs(w[j] - wave) > 0.5 * dw] = np.nan
+    return out
+
+
+def sigma_on(ctx, wave: np.ndarray) -> np.ndarray:
+    """1-sigma error of the SFrame for the PT fibers on the DAP-output grid (NaN where ivar <= 0)."""
+    iv = sframe_on(ctx, "IVAR", wave)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(np.isfinite(iv) & (iv > 0), 1.0 / np.sqrt(np.where(iv > 0, iv, 1.0)), np.nan)
+
+
+def local_baseline(r: np.ndarray, wave: np.ndarray, models, exclude=None, frac: float = 0.02,
+                   grow: int = 3, min_pix: int = 5):
+    """
+    Residual continuum per spectrum: straight line through the medians of ``r`` in the line-free
+    pixels left and right of the window centre (constant if only one side has >= min_pix pixels,
+    0 if none). Line pixels = where any of the line ``models`` exceeds ``frac`` x its peak in that
+    spectrum (grown by ``grow`` pixels), plus ``exclude`` (n_spec, n_pix). Removes the imperfect
+    DAP continuum (stellar mismatch, smooth term) under the lines, which otherwise inflates the line
+    residuals in fibers with a bright continuum. Returns (r - base, base).
+    """
+    r = np.asarray(r, float)
+    line = np.zeros(r.shape, bool)
+    with warnings.catch_warnings(), np.errstate(invalid="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for m in models:
+            m = np.abs(np.asarray(m, float))
+            pk = np.nanmax(np.where(np.isfinite(m), m, np.nan), axis=1)
+            line |= np.nan_to_num(m) > frac * np.nan_to_num(pk, nan=np.inf)[:, None]
+        if exclude is not None:
+            line |= exclude
+        if grow > 0:
+            g = line.copy()
+            for k in range(1, grow + 1):
+                g[:, k:] |= line[:, :-k]
+                g[:, :-k] |= line[:, k:]
+            line = g
+        free = ~line & np.isfinite(r)
+        wc = 0.5 * (wave[0] + wave[-1])
+        L, R = free & (wave < wc)[None, :], free & (wave >= wc)[None, :]
+        W = np.broadcast_to(wave, r.shape)
+        yl, yr = np.nanmedian(np.where(L, r, np.nan), axis=1), np.nanmedian(np.where(R, r, np.nan), axis=1)
+        xl, xr = np.nanmedian(np.where(L, W, np.nan), axis=1), np.nanmedian(np.where(R, W, np.nan), axis=1)
+        nl, nr = L.sum(axis=1), R.sum(axis=1)
+    both = (nl >= min_pix) & (nr >= min_pix) & (xr > xl)
+    base = np.zeros(r.shape)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        base[both] = yl[both, None] + (yr - yl)[both, None] * (wave[None, :] - xl[both, None]) / (xr - xl)[both, None]
+    only_l, only_r = (nl >= min_pix) & ~both, (nr >= min_pix) & ~both & (nl < min_pix)
+    base[only_l] = yl[only_l, None]
+    base[only_r] = yr[only_r, None]
+    return r - base, base
+
+
 def excess_residual(r: np.ndarray, sig: np.ndarray, model: np.ndarray, use: np.ndarray):
     """
     Unmodelled flux fraction per spectrum in the pixels ``use``:

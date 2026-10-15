@@ -155,8 +155,8 @@ class Absorption(Metric):
         status, dabs = {}, {}
         for k in p["features"]:
             wave, planes = ctx.dap_output(f"abs_{k}")
-            _, sky = ctx.dap_sframe_window("SKY", wave[0], wave[-1])
-            sky = sky[:, :wave.size]
+            from ._dapout import sframe_on
+            sky = sframe_on(ctx, "SKY", wave)
             data = planes[NOGAS][sel].astype(float)
             model = planes[JOINT][sel].astype(float) - planes[GAS_NP][sel]
             with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):

@@ -88,7 +88,9 @@ def _out_windows_for(metric: str) -> Dict[str, tuple]:
     if metric == "qa_absorption":
         return {f"dg_abs_{k}": (b[0][0] - 15, b[2][1] + 15, (2, 5, 6)) for k, b in dap_absorption.FEATURES.items()}
     if metric == "qa_telluric":
-        return {f"dg_tell_{k}": (cl[0] - 5, cr[1] + 5, (1, 2, 5, 6)) for k, (b, cl, cr) in drp_telluric.BANDS.items()}
+        out = {f"dg_tell_{k}": (cl[0] - 5, cr[1] + 5, (1, 2, 5, 6)) for k, (b, cl, cr) in drp_telluric.BANDS.items()}
+        out.update(drp_telluric.Telluric().output_windows())     # metric's own windows (EW_dap if not stored)
+        return out
     return {}
 
 
@@ -177,27 +179,39 @@ def ex_flatfield(ctx, r, cls):
     ch = spch.split("-")[-1]
     name = next((n for n, (wl, c) in SKY_LINES.items() if c == ch), list(SKY_LINES)[0])
     wl = SKY_LINES[name][0]
+    pr = _minst("qa_flatfield", ctx.cfg).params
     rows = ctx.good_sci_index
     spec = np.asarray(ctx.slitmap["spectrographid"])[rows]
-    w, f = ctx.sframe_window("FLUX", wl - 8, wl + 8, rows=rows)
-    _, s = ctx.sframe_window("SKY", wl - 8, wl + 8, rows=rows)
+    co = pr["cont_outer"]
+    w, f = ctx.sframe_window("FLUX", wl - co - 1, wl + co + 1, rows=rows)
+    _, s = ctx.sframe_window("SKY", wl - co - 1, wl + co + 1, rows=rows)
     y = f + s
+    # local continuum per fiber (median of the side bands used by the metric) subtracted, as in the
+    # metric: the profiles compare the sky-LINE fluxes of the spectrographs only
+    d = np.abs(w - wl)
+    cont = (d >= pr["cont_inner"]) & (d <= co)
+    y = y - _nanmed(y[:, cont], axis=1)[:, None]
     ref = _nanmed(y)
-    p = _panel(f"{name}: worst {spch} {_f(r.get('flatfield_max_rel_offset', np.nan)):.1f}%", ylabel="sky line / all fibers")
+    p = _panel(f"{name}: worst {spch} {_f(r.get('flatfield_max_rel_offset', np.nan)):.1f}% (local continuum "
+               f"subtracted)", ylabel="sky line - continuum, / peak of all fibers")
     for sp in (1, 2, 3):
         m = spec == sp
         if m.sum():
             p["curves"].append((w, _nanmed(y[m]) / np.nanmax(ref), f"sp{sp} {_f(r.get(f'flatfield_off_sp{sp}_{ch}', np.nan)):+.1f}%",
                                 dict(color=SPEC_COL[sp])))
+    p["spans"] += [(wl - co, wl - pr["cont_inner"], "0.85"), (wl + pr["cont_inner"], wl + co, "0.85"),
+                   (wl - pr["half_width"], wl + pr["half_width"])]
+    p["hlines"].append(0.0)
     return p
 
 
 def _ex_relflux(ctx, r, cls, key, metric):
     """Median-stacked normalised continuum around the channel overlap (adopted signal), masked
-    pixels in grey, 10-A bin medians used in the fits, and the straight-line fits of each side
-    extrapolated to the overlap centre (the metric fits each fiber; shown here for the stack)."""
+    pixels in grey, 10-A bin medians, straight lines fitted to the outer slope windows of each side
+    (solid over the side, dashed across the other side; v1.15: the 100-A jump zones next to the
+    boundary, darker shading, enter only the levels), and the common-slope continuum when the
+    slope-model veto applies (the metric fits each fiber; shown here for the stack)."""
     from .metrics import drp_relflux as rf
-    from .registry import available_metrics
     pr = _minst(metric, ctx.cfg).params
     ov, blue, red = pr["overlap"], pr["blue_side"], pr["red_side"]
     res = rf.measure_steps(ctx, pr)
@@ -206,37 +220,58 @@ def _ex_relflux(ctx, r, cls, key, metric):
     if sig == "src" and "stack_src" in res:
         stack, lm, n = res["stack_src"], res["mask_src"].copy(), res.get("n_src_sel", 0)
     else:
+        sig = "obs"
         stack, lm, n = res["stack_obs"], res["mask_obs"].copy(), "all"
+    model = res.get(f"model_{sig}", "sides")
     lm = rf.fit_mask(w, lm, pr.get("mask_windows", ()))
+    z = rf.zones(blue, red, pr.get("edge", 0.0))
     x0 = 0.5 * (ov[0] + ov[1])
     g = lambda k: _f(r.get(f"relflux_{key}_{k}", np.nan))  # noqa: E731
-    p = _panel(f"{key}: step {g('median_step'):+.1%}\u00b1{g('e_median_step'):.1%}, slope mismatch "
-               f"{g('median_kink'):+.1%}\u00b1{g('e_median_kink'):.1%} at \u00b1{pr['lever']:.0f} A\n"
+    kt = (f"slope mismatch {g('median_kink'):+.1%}\u00b1{g('e_median_kink'):.1%}" if model == "sides" else
+          f"side slopes differ {g('median_kink_raw'):+.1%} (stack {g('kink_stack'):+.1%}±{g('e_kink_stack'):.1%}: "
+          f"not significant, common slope)")
+    p = _panel(f"{key}: step {g('median_step'):+.1%}\u00b1{g('e_median_step'):.1%}, {kt} at \u00b1{pr['lever']:.0f} A\n"
                f"({sig}, n={n}; common gradient {g('median_gradient'):+.1%}/100 A)",
                ylabel="median normalised flux (src: FLUX of bright fibers; obs: FLUX+SKY)")
     p["curves"].append((w, np.where(~lm, stack, np.nan), "unmasked pixels", dict(color="k", lw=0.6)))
     p["curves"].append((w, np.where(lm, stack, np.nan), "masked (lines, tellurics)", dict(color="0.78", lw=0.4)))
-    fits_y = []
-    for side, col, lab in ((blue, "#2a78d6", "blue side"), (red, "#d03b3b", "red side")):
-        msk = (w >= side[0]) & (w <= side[1]) & ~lm
+    fits_y, coefs = [], {}
+    for name, sw, zw, col, lab in (("blue", z["blue_slope"], z["blue_zone"], "#2a78d6", "blue side"),
+                                   ("red", z["red_slope"], z["red_zone"], "#d03b3b", "red side")):
+        msk = (w >= sw[0]) & (w <= sw[1]) & ~lm
+        mz = (w >= zw[0]) & (w <= zw[1]) & ~lm
         xb, yb = rf._binned(w, stack[None, :], msk, 10.0)
+        xz, yz = rf._binned(w, stack[None, :], mz, 10.0)
+        if xz.size:
+            p["curves"].append((xz, yz[0], None, dict(color=col, ls="none", marker="s", ms=2.5, mfc="none")))
         if xb.size >= 4:
             yb = yb[0]
             c = np.polyfit(xb - x0, yb, 1)
-            p["curves"].append((xb, yb, f"{lab}: 10-A bin medians", dict(color=col, ls="none", marker="o", ms=2.5)))
-            # fit over its own side (solid) and extrapolated across the other side (dashed): a step
-            # shows as an offset at the overlap, a slope mismatch as diverging lines
-            xs = np.array([side[0], x0]) if side is blue else np.array([x0, side[1]])
-            xo = np.array([x0, red[1]]) if side is blue else np.array([blue[0], x0])
+            coefs[name] = (c, xb - x0, yb)
+            p["curves"].append((xb, yb, f"{lab}: bin medians (squares: jump zone)", dict(color=col, ls="none", marker="o", ms=2.5)))
+            side = blue if name == "blue" else red
+            xs = np.array([side[0], x0]) if name == "blue" else np.array([x0, side[1]])
+            xo = np.array([x0, red[1]]) if name == "blue" else np.array([blue[0], x0])
             p["curves"].append((xs, np.polyval(c, xs - x0), f"{lab} fit", dict(color=col, lw=1.4)))
             p["curves"].append((xo, np.polyval(c, xo - x0), None, dict(color=col, lw=0.9, ls="--")))
             fits_y += list(np.polyval(c, xs - x0)) + list(yb)
-    p["spans"] += [tuple(ov), (blue[0], blue[1], "#cfe0f5"), (red[0], red[1], "#f6d5d2")]
+    if model != "sides" and len(coefs) == 2:
+        (cb, xb_, yb_), (cr, xr_, yr_) = coefs["blue"], coefs["red"]
+        wb = res.get(f"dev_{sig}", {}).get("w_blue", 0.5)
+        sl = wb * cb[0] + (1 - wb) * cr[0]
+        for xx, yy, ls_ in ((xb_, yb_, "-"), (xr_, yr_, "-")):
+            a = np.median(yy - sl * xx)
+            xl = np.array([blue[0], red[1]]) - x0
+            p["curves"].append((xl + x0, a + sl * xl, None, dict(color="#1baf7a", lw=0.8, ls=":")))
+        p["curves"][-1] = (p["curves"][-1][0], p["curves"][-1][1], f"common slope (w_blue {wb:.2f})", p["curves"][-1][3])
+    p["spans"] += [tuple(ov), (z["blue_slope"][0], z["blue_slope"][1], "#cfe0f5"), (z["red_slope"][0], z["red_slope"][1], "#f6d5d2"),
+                   (z["blue_zone"][0], z["blue_zone"][1], "#9fbfe8"), (z["red_zone"][0], z["red_zone"][1], "#eaa9a2")]
     # common y range 0.8-1.2, extended only if the fitted lines / bin medians fall outside
     lo, hi = 0.8, 1.2
     if fits_y:
         lo, hi = min(lo, np.nanmin(fits_y) - 0.02), max(hi, np.nanmax(fits_y) + 0.02)
     p["ylim"] = (lo, hi)
+
     p["vlines"].append(x0)
     return p
 
@@ -251,7 +286,8 @@ def ex_relflux_rz(ctx, r, cls):
 
 def _ex_wavecal(ctx, r, cls, ch):
     from .metrics._skylines import SKY_LINES, lines_of
-    names = lines_of(ch)
+    excl = tuple(_minst(f"qa_wavecal_{ch}", ctx.cfg).params.get("exclude", ()))
+    names = [n for n in lines_of(ch) if n not in excl]
     offs = {n: _f(r.get(f"wavecal_{ch}_off_{n}", np.nan)) for n in names}
     name = max(offs, key=lambda n: abs(offs[n]) if np.isfinite(offs[n]) else -1)
     rest = SKY_LINES[name][0]
@@ -323,9 +359,25 @@ def ex_telluric(ctx, r, cls):
     b = max(score, key=score.get)
     band, cl, cr = BANDS[b]
     meth = dict(x.split(":") for x in _s(r.get("telluric_method", "")).split() if ":" in x).get(b, "-")
-    p = _panel(f"{b}: EW {ews[b]:+.2f} A, rms {rms[b]:.3f} (method {meth}; EW dap "
-               f"{_f(r.get(f'telluric_ew_dap_{b}', np.nan)):+.2f}, interp {_f(r.get(f'telluric_ew_interp_{b}', np.nan)):+.2f})",
-               ylabel="normalised flux; ratio - 0.3")
+    mt = _minst("qa_telluric", ctx.cfg)
+    ew_d, ew_i = _f(r.get(f"telluric_ew_dap_{b}", np.nan)), _f(r.get(f"telluric_ew_interp_{b}", np.nan))
+    with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
+        warnings.simplefilter("ignore")
+        try:     # not stored (method not needed / older run): measure here for the title
+            if not np.isfinite(ew_i):
+                rs = mt._band(ctx, ctx.good_sci_index, band, cl, cr)
+                ew_i = rs["ew"] if rs is not None else np.nan
+            if not np.isfinite(ew_d) and ctx.has_dap and ctx.has_dap_output:
+                rd = mt._band_dap(ctx, b, band, cl, cr)
+                ew_d = rd["ew"] if rd is not None else np.nan
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ew(x):
+        return f"{x:+.2f}" if np.isfinite(x) else "n/a"
+    mname = {"n": "DAP-normalised", "s": "interpolation"}.get(meth, meth)
+    p = _panel(f"{b}: EW {_ew(ews[b])} A, rms {rms[b]:.3f} (adopted: {mname}; EW DAP-norm. {_ew(ew_d)}, "
+               f"interp. {_ew(ew_i)})", ylabel="normalised flux; ratio - 0.3")
 
     def line(x, y):
         ml, mr = (x >= cl[0]) & (x <= cl[1]), (x >= cr[0]) & (x <= cr[1])
@@ -445,28 +497,40 @@ def ex_pmfit(ctx, r, cls):
     k = _s(r.get("dap_pmfit_worst_line", ""), "Halpha")
     key = {"OII3727": "OII3727", "Hbeta": "Hbeta", "OIII5007": "OIII5007", "Halpha": "Halpha",
            "NII6583": "NII6583", "SII6716": "SII6716", "SII6731": "SII6731"}.get(k, "Halpha")
+    from .metrics._dapout import excess_residual, local_baseline, sframe_on, sigma_on
     names = BRIGHT.get(key, BRIGHT["Halpha"])
+    pr = _minst("qa_dap_pmfit", ctx.cfg).params
     wd, pl = ctx.dap_output(f"dg_{key}")
     F = sum(np.nan_to_num(np_column(ctx, f"flux_{n}")) for n in names)
     EF = np.sqrt(sum(np.nan_to_num(np_column(ctx, f"e_flux_{n}")) ** 2 for n in names))
-    _, ivar = ctx.dap_sframe_window("IVAR", wd[0], wd[-1])
-    ivar = ivar[:, :wd.size]
+    vel, disp = np_column(ctx, f"vel_{names[-1]}"), np_column(ctx, f"disp_{names[-1]}")
+    sig = sigma_on(ctx, wd)
+    wl = [float(n.rsplit("_", 1)[1]) for n in names]
+    z = np.nan_to_num(vel) / C_KMS
+    half = np.clip(np.nan_to_num(3.0 * disp, nan=pr["half_width"]), pr["half_width"], 10.0)
+    use = (wd[None, :] >= (min(wl) * (1 + z) - half)[:, None]) & (wd[None, :] <= (max(wl) * (1 + z) + half)[:, None])
     with np.errstate(invalid="ignore", divide="ignore"):
-        ok = (EF > 0) & (F / EF > 10)
-        r_pm = np.where(ivar > 0, pl[0] - pl[8], np.nan)      # masked pixels excluded (as in the metric)
-        num = np.nansum(np.abs(r_pm), axis=1)
-        den = np.nansum(pl[7], axis=1)
-        fx = np.where(ok & (den > 0), num / den, np.nan)
+        ok = (EF > 0) & (F / EF > pr["min_snr"]) & np.isfinite(vel)
+        r_pm = np.where(np.isfinite(sig), pl[0] - pl[8], np.nan)      # masked pixels excluded (as in the metric)
+        base = np.zeros_like(r_pm)
+        if pr.get("subtract_baseline", True):
+            r_pm, base = local_baseline(r_pm, wd, (pl[7], pl[6]), exclude=use)
+        fx, _, _, _ = excess_residual(r_pm, sig, pl[7].astype(float), use)
+        fx = np.where(ok, fx, np.nan)
     rng = np.random.default_rng(int(ctx.drp("expnum", 0)))
-    i = _pick(fx, cls, rng, ok & (fx < np.nanpercentile(fx, 75)))
+    i = _pick(fx, cls, rng, ok & (fx < np.nanpercentile(fx, 75)) if np.isfinite(fx).any() else ok)
     ids = np.asarray(ctx.dap_table("PT")["id"]).astype(str)
-    _, mk = ctx.dap_sframe_window("MASK", wd[0], wd[-1])
-    p = _panel(f"{key} fiber {ids[i]}: |resid|/model {fx[i]:.2f}; exp: frac_poor "
-               f"{_f(r.get('dap_pmfit_frac_poor', np.nan)):.2f}", ylabel="flux (data - stellar)")
-    p["curves"] += [(wd, pl[0][i] - (pl[8][i] - pl[7][i]), "data - stellar", dict(color="k", drawstyle="steps-mid")),
+    mk = sframe_on(ctx, "MASK", wd)
+    p = _panel(f"{key} fiber {ids[i]}: unmodelled fx {fx[i]:.2f}; exp: frac_poor "
+               f"{_f(r.get('dap_pmfit_frac_poor', np.nan)):.2f}",
+               ylabel="flux (data - DAP continuum - residual baseline)")
+    cont = pl[8][i] - pl[7][i] + base[i]          # stellar + smooth term + residual baseline
+    p["curves"] += [(wd, pl[0][i] - cont, "data - continuum", dict(color="k", drawstyle="steps-mid")),
                     (wd, pl[7][i], "PM line model", dict(color="#d03b3b")),
-                    (wd, r_pm[i], "residual", dict(color="#4a3aa7", lw=0.8))]
-    _mark_masked(p, wd, mk[:, :wd.size], i)
+                    (wd, r_pm[i], "residual (baseline-subtracted)", dict(color="#4a3aa7", lw=0.8)),
+                    (wd, base[i], "removed residual baseline", dict(color="0.5", ls="--", lw=0.7))]
+    _mark_masked(p, wd, mk, i)
+    p["spans"].append((wd[use[i]].min(), wd[use[i]].max(), "#fab219") if use[i].any() else (wd[0], wd[0], "w"))
     p["hlines"].append(0.0)
     return p
 
@@ -477,24 +541,35 @@ def ex_npfluxes(ctx, r, cls):
     g = _s(r.get("dap_npfluxes_worst_group", ""), "Halpha6563")
     if g not in GROUPS:
         g = "Halpha6563"
+    from .metrics._dapout import local_baseline
     prim, (w0, w1) = GROUPS[g]
+    pr = _minst("qa_dap_npfluxes", ctx.cfg).params
     wd, pl = ctx.dap_output(f"dg_fl_{g}")
     F, E = np_column(ctx, f"flux_{prim}"), np_column(ctx, f"e_flux_{prim}")
     v = np_column(ctx, "vel_Halpha_6562.85")
     with np.errstate(invalid="ignore", divide="ignore"):
-        sel = np.where((E > 0) & (F / E >= 3) & np.isfinite(v))[0]
-    p = _panel(f"{g}: net {_f(r.get(f'dap_npfluxes_net_{g}', np.nan)):+.2f} (n={sel.size})", xlabel="rest wavelength [A]",
-               ylabel="stacked flux")
+        sel = np.where((E > 0) & (F / E >= pr["min_snr"]) & np.isfinite(v))[0]
+    p = _panel(f"{g}: net {_f(r.get(f'dap_npfluxes_net_{g}', np.nan)):+.2f} (n={sel.size}; residual baseline "
+               f"subtracted)", xlabel="rest wavelength [A]", ylabel="stacked flux (data - DAP continuum)")
     if sel.size:
         dw = float(wd[1] - wd[0])
         sh = np.round(0.5 * (w0 + w1) * v[sel] / C_KMS / dw).astype(int)
         x = np.arange(wd.size)
+        res = pl[4][sel].astype(float)
+        base = np.zeros_like(res)
+        if pr.get("subtract_baseline", True):
+            xw = np.arange(int(np.ceil((w0 - wd[0]) / dw)), int(np.floor((w1 - wd[0]) / dw)) + 1)
+            win = np.zeros(res.shape, bool)
+            np.put_along_axis(win, np.clip(sh[:, None] + xw[None, :], 0, wd.size - 1), True, axis=1)
+            res, base = local_baseline(res, wd, (pl[6][sel],), exclude=win)
         idx = np.clip(x[None, :] + sh[:, None], 0, wd.size - 1)
-        R = np.nansum(np.take_along_axis(pl[4][sel], idx, axis=1), axis=0)
+        R = np.nansum(np.take_along_axis(res, idx, axis=1), axis=0)
+        B = np.nansum(np.take_along_axis(base, idx, axis=1), axis=0)
         G = np.nansum(np.take_along_axis(pl[6][sel], idx, axis=1), axis=0)
-        p["curves"] += [(wd, R + G, "data (stack)", dict(color="k", drawstyle="steps-mid")),
+        p["curves"] += [(wd, R + G, "data - continuum (stack)", dict(color="k", drawstyle="steps-mid")),
                         (wd, G, "NP model (all lines)", dict(color="#2a78d6")),
-                        (wd, R, "residual", dict(color="#d03b3b", lw=0.8))]
+                        (wd, R, "residual", dict(color="#d03b3b", lw=0.8)),
+                        (wd, B, "removed residual baseline", dict(color="0.5", ls="--", lw=0.7))]
     p["spans"].append((w0, w1))
     p["hlines"].append(0.0)
     return p
@@ -522,32 +597,97 @@ def ex_absorption(ctx, r, cls):
 
 
 def ex_gaskinematics(ctx, r, cls):
+    """The test that drives the flag: (a) stacked normalised profiles of the line pair with the
+    largest |dv| (a defined pair: falls back from the stored worst pair to any measured one), or
+    (b) when the spatial tests drive the flag (or no pair is measured), the distributions of the
+    Halpha velocity residuals w.r.t. the neighbouring fibers per spectrograph (outlier limits as
+    vertical lines) with the spectrograph-boundary offsets in the title."""
     from .metrics._dapout import np_column
-    from .metrics.dap_gaskinematics import REST
-    pair = _s(r.get("gaskinematics_worst_pair", ""), "H_Hbeta4861")
-    other = {"Hbeta4861": ("Hbeta", "Hbeta_4861.36"), "Hgamma4340": ("Hgamma", "Hgamma_4340.49"),
-             "HI9229": ("P9", "HI_9229.02"), "SIII9531": ("SIII9531", "[SIII]_9531.1"),
-             "HeI6678": ("HeI6678", "HeI_6678.15"), "HeI7065": ("HeI7065", "HeI_7065.19")}
-    ref = {"H": ("Halpha", "Halpha_6562.85"), "SIII": ("SIII9069", "[SIII]_9069.0"), "HeI": ("HeI5876", "HeI_5876.0")}
-    g, _, o = pair.partition("_")
-    a = ref.get(g, ref["H"])
-    b = other.get(o, other["Hbeta4861"])
-    p = _panel(f"{_lname(b[1])} - {_lname(a[1])}: dv {_f(r.get(f'gaskinematics_dv_{pair}', np.nan)):+.1f} km/s; "
-               f"max spectrograph-boundary offset {_f(r.get('gaskinematics_max_boundary_dv', np.nan)):.1f} km/s; "
-               f"Ha outliers {_f(r.get('gaskinematics_frac_out_v', np.nan)):.3f}",
-               xlabel="velocity w.r.t. rest (air) wavelength [km/s]", ylabel="normalised gas profile (stack)")
-    s1 = np_column(ctx, f"flux_{a[1]}") / np_column(ctx, f"e_flux_{a[1]}")
-    s2 = np_column(ctx, f"flux_{b[1]}") / np_column(ctx, f"e_flux_{b[1]}")
-    sel = np.where((s1 > 10) & (s2 > 10))[0]
-    for (key, line), col in ((a, "k"), (b, "#d03b3b")):
-        wd, pl = ctx.dap_output(f"dg_{key}")
-        rest = REST.get(line, float(line.rsplit("_", 1)[1]))
-        vv = (wd / rest - 1) * C_KMS
-        if sel.size:
-            prof = _nanmed(pl[3][sel] / np.nanmax(pl[3][sel], axis=1, keepdims=True))
-            m = np.abs(vv) < 300
-            p["curves"].append((vv[m], prof[m], _lname(line), dict(color=col)))
-    p["vlines"].append(0.0)
+    from .metrics.dap_gaskinematics import REST, _Neighbours, _col, _np_all, _pairs, pkey
+    pr = _minst("qa_gaskinematics", ctx.cfg).params
+    win = {"Halpha_6562.85": "Halpha", "Hbeta_4861.36": "Hbeta", "Hgamma_4340.49": "Hgamma",
+           "HI_9229.02": "P9", "[SIII]_9531.1": "SIII9531", "[SIII]_9069.0": "SIII9069",
+           "HeI_5876.0": "HeI5876", "HeI_6678.15": "HeI6678", "HeI_7065.19": "HeI7065"}
+    cands = {}
+    for g, ref, o in _pairs():
+        k = f"{g}_{pkey(o)}"
+        dv, e = _f(r.get(f"gaskinematics_dv_{k}", np.nan)), _f(r.get(f"gaskinematics_e_dv_{k}", np.nan))
+        if np.isfinite(dv) and g not in pr["report_only"] and ref in win and o in win:
+            cands[k] = (ref, o, dv, e)
+    pair_issue = any(abs(dv) > pr["dv_warn"] and abs(dv) > pr["nsig"] * (e if np.isfinite(e) else 0)
+                     for _, _, dv, e in cands.values())
+    fo = np.nanmax([_f(r.get("gaskinematics_frac_out_v", np.nan)), _f(r.get("gaskinematics_frac_out_disp", np.nan)),
+                    -1.0])
+    mb = np.nanmax([_f(r.get("gaskinematics_max_boundary_dv", np.nan)),
+                    _f(r.get("gaskinematics_max_boundary_ddisp", np.nan)), -1.0])
+    spatial_issue = fo > pr["frac_out_warn"] or mb > pr["boundary_warn"]
+    if cands and (pair_issue or not spatial_issue or cls == "GOOD"):
+        wp = _s(r.get("gaskinematics_worst_pair", ""))
+        k = wp if wp in cands else max(cands, key=lambda q: abs(cands[q][2]))
+        ref, o, dv, e = cands[k]
+        p = _panel(f"{_lname(o)} - {_lname(ref)}: dv {dv:+.1f}+-{e:.1f} km/s; max boundary offset "
+                   f"{mb:.1f} km/s; Ha outliers {max(fo, 0):.3f}",
+                   xlabel="velocity w.r.t. rest (air) wavelength [km/s]", ylabel="normalised gas profile (stack)")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            s1 = np_column(ctx, f"flux_{ref}") / np_column(ctx, f"e_flux_{ref}")
+            s2 = np_column(ctx, f"flux_{o}") / np_column(ctx, f"e_flux_{o}")
+            for thr in (pr["min_snr"], 5.0, 3.0):
+                sel = np.where((s1 > thr) & (s2 > thr))[0]
+                if sel.size >= 5:
+                    break
+        for line, col in ((ref, "k"), (o, "#d03b3b")):
+            wd, pl = ctx.dap_output(f"dg_{win[line]}")
+            rest = REST.get(line, float(line.rsplit("_", 1)[1]))
+            vv = (wd / rest - 1) * C_KMS
+            if sel.size:
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    prof = _nanmed(pl[3][sel] / np.nanmax(pl[3][sel], axis=1, keepdims=True))
+                m = np.abs(vv) < 300
+                p["curves"].append((vv[m], prof[m], f"{_lname(line)} (n={sel.size}, S/N>{thr:g})", dict(color=col)))
+        p["vlines"].append(0.0)
+        return p
+    # (b) spatial consistency of the brightest line
+    t = _np_all(ctx)
+    line = pr["line"]
+    wl = float(line.rsplit("_", 1)[1])
+    v = _col(t, f"vel_{line}")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ok = (_col(t, f"flux_{line}") / _col(t, f"e_flux_{line}") > pr["min_snr"]) & np.isfinite(v)
+    bd = "; ".join(f"sp{q} {_f(r.get(f'gaskinematics_dv_sp{q}', np.nan)):+.1f}" for q in (1, 2, 3))
+    p = _panel(f"{_lname(line)} spatial: outliers v {_f(r.get('gaskinematics_frac_out_v', np.nan)):.3f}, sigma "
+               f"{_f(r.get('gaskinematics_frac_out_disp', np.nan)):.3f}; boundary dv {bd} km/s"
+               + ("" if cands else " (no line pair measured)"),
+               xlabel="v - median v of neighbours [km/s]", ylabel="fibers (normalised histogram)")
+    if ok.sum() < 20:
+        return p
+    ra, dec = _col(t, "ra"), _col(t, "dec")
+    x = (ra - np.nanmedian(ra)) * np.cos(np.deg2rad(np.nanmedian(dec))) * 3600.0
+    y = (dec - np.nanmedian(dec)) * 3600.0
+    P = np.c_[x, y][ok]
+    tree = _Neighbours(P)
+    vv = v[ok]
+    rv = np.full(vv.size, np.nan)
+    for i, nb in enumerate(tree.query_ball_point(P, pr["radius_pitch"] * tree.pitch)):
+        nb = [j for j in nb if j != i]
+        if len(nb) >= pr["min_neighbours"]:
+            rv[i] = vv[i] - np.median(vv[nb])
+    rows = ctx.dap_sframe_rows if ctx.has_sframe else None
+    if rows is not None:
+        spec = np.where(rows >= 0, np.asarray(ctx.slitmap["spectrographid"])[np.clip(rows, 0, None)], -1)
+    else:
+        spec = (np.asarray(t["fiberid"]).astype(int) - 1) // 648 + 1
+    sp = spec[ok]
+    lim = max(pr["out_nsig"] * 1.4826 * float(np.nanmedian(np.abs(rv))), pr["out_floor"])
+    bins = np.linspace(-3 * lim, 3 * lim, 61)
+    xc = 0.5 * (bins[1:] + bins[:-1])
+    for q in (1, 2, 3):
+        m = (sp == q) & np.isfinite(rv)
+        if m.sum() >= 5:
+            h, _ = np.histogram(np.clip(rv[m], bins[0], bins[-1]), bins=bins)
+            p["curves"].append((xc, h / max(h.max(), 1), f"sp{q} (n={m.sum()}, median {np.median(rv[m]):+.1f})",
+                                dict(color=SPEC_COL[q], drawstyle="steps-mid")))
+    p["vlines"] += [-lim, lim]
+    p["robust_ylim"] = False
     return p
 
 
@@ -564,8 +704,8 @@ def ex_lineratios(ctx, r, cls):
     col = {"oiii": "#2a78d6", "nii": "#eb6834", "siii": "#1baf7a", "hahb": "#d03b3b", "hbhg": "#4a3aa7"}
     lab = {"oiii": "[OIII]5007/4959", "nii": "[NII]6584/6548", "siii": "[SIII]9531/9069",
            "hahb": "Ha/Hb", "hbhg": "Hb/Hg"}
-    bins = np.linspace(0.5, 1.5, 51)
-    xc = 0.5 * (bins[1:] + bins[:-1])
+    bins = np.geomspace(0.4, 5.0, 64)          # log axis: Balmer decrements of reddened gas reach 2-4x Case B
+    xc = np.sqrt(bins[1:] * bins[:-1])
     parts, curves = [], []
     with np.errstate(invalid="ignore", divide="ignore"):
         for t, (num, den) in {**DOUBLETS, **BALMER}.items():
@@ -580,18 +720,28 @@ def ex_lineratios(ctx, r, cls):
                 y = y / pr[f"ratio_{t}"]
             flag = _s(r.get(f"lineratios_{t}_flag", ""), "UNDEFINED")
             if flag != "UNDEFINED":
-                stat = (f"{_f(r.get(f'lineratios_{t}_dev', np.nan)):+.0f}%" if t in DOUBLETS
-                        else f"{_f(r.get(f'lineratios_{t}_fbelow', np.nan)):.2f} below")
+                if t in DOUBLETS:
+                    stat = f"{_f(r.get(f'lineratios_{t}_dev', np.nan)):+.0f}%"
+                    if t == "siii" and np.isfinite(_f(r.get("lineratios_siii_dev_raw", np.nan))):
+                        stat += f" (uncorr. {_f(r.get('lineratios_siii_dev_raw', np.nan)):+.0f}%)"
+                else:
+                    stat = (f"median {_f(r.get(f'lineratios_{t}_med', np.nan)):.2f}, "
+                            f"{100 * _f(r.get(f'lineratios_{t}_fbelow', np.nan)):.0f}% < Case B")
                 parts.append(f"{lab[t]} {stat} ({flag.replace(' ISSUE', '')})")
+            elif 0 < y.size < pr["min_fibers"]:
+                parts.append(f"{lab[t]} ignored (n={y.size} < {pr['min_fibers']})")
             if y.size >= 5:
                 h, _ = np.histogram(np.clip(y, bins[0], bins[-1]), bins=bins)
-                curves.append((xc, h / max(h.max(), 1), f"{lab[t]} (n={y.size})",
-                               dict(color=col[t], drawstyle="steps-mid")))
-    p = _panel("; ".join(parts), xlabel="R_obs / R_expected (Balmer: Case B)",
+                fo = float(np.mean((y < bins[0]) | (y > bins[-1])))
+                curves.append((xc, h / max(h.max(), 1), f"{lab[t]} (n={y.size}" + (f", {fo:.0%} outside" if fo >= 0.01 else "")
+                               + ")", dict(color=col[t], drawstyle="steps-mid",
+                                           ls="-" if y.size >= pr["min_fibers"] else ":")))
+    p = _panel("; ".join(parts) or "no sub-test evaluable", xlabel="R_obs / R_expected (Balmer: Case B), log scale",
                ylabel="fibers (normalised histogram)")
     p["curves"] += curves
     p["vlines"].append(1.0)
     p["robust_ylim"] = False
+    p["xscale"] = "log"
     return p
 
 
@@ -659,6 +809,13 @@ def _draw(ax, p, cls):
         if hi > lo:
             pad = 0.08 * (hi - lo)
             ax.set_ylim(lo - pad, hi + pad)
+    if p.get("xscale"):
+        ax.set_xscale(p["xscale"])
+        if p["xscale"] == "log":
+            from matplotlib.ticker import FixedLocator, NullFormatter, ScalarFormatter
+            ax.xaxis.set_major_locator(FixedLocator([0.5, 0.7, 1, 1.5, 2, 3, 4]))
+            ax.xaxis.set_major_formatter(ScalarFormatter())
+            ax.xaxis.set_minor_formatter(NullFormatter())
     title = f"{p.get('expnum', '')}  {p['title']}"
     ax.set_title("\n".join(textwrap.wrap(title, 44)), fontsize=5.8, loc="left")
     ax.tick_params(labelsize=5.5)
@@ -752,8 +909,102 @@ def _AsinhNormCompat(linear_width, vmin, vmax):  # noqa: N802 - factory (matplot
     return _make_asinh_compat()(linear_width, vmin, vmax)
 
 
-def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
-    """Halpha maps of the tiles, one panel per sky region (tiles within 2 deg), max_panels largest.
+def _fm_windows(ra, de, gidx, isflag, max_panels, box=6.0):
+    """Panels of the fluxmap page (v1.15): regions = tile groups within 2 deg; a region larger than
+    1.4 box is cut into box x box windows centred greedily on the densest concentration of flagged
+    exposures. Windows sorted by their number of flagged exposures (then size).
+    Returns (list of index arrays of the shown windows, number of windows)."""
+    wins = []
+    for g in _clusters(ra[gidx], de[gidx]):
+        g = gidx[g]
+        r0 = float(np.median(ra[g]))
+        x = ((ra[g] - r0 + 180.0) % 360.0 - 180.0) * np.cos(np.deg2rad(de[g]))
+        y = de[g]
+        if max(np.ptp(x), np.ptp(y)) <= 1.4 * box:
+            wins.append((int(isflag[g].sum()), len(g), g))
+            continue
+        todo = set(np.where(isflag[g])[0])
+        while todo and len(wins) < 4 * max_panels:
+            t = np.array(sorted(todo))
+            cnt = [np.sum((np.abs(x[t] - x[k]) < box / 2) & (np.abs(y[t] - y[k]) < box / 2)) for k in t]
+            k = t[int(np.argmax(cnt))]
+            inb = (np.abs(x - x[k]) < box / 2) & (np.abs(y - y[k]) < box / 2)
+            wins.append((int(isflag[g][inb].sum()), int(inb.sum()), g[inb]))
+            todo -= set(np.where(inb)[0])
+    wins.sort(key=lambda w_: (-w_[0], -w_[1]))
+    return [w_[2] for w_ in wins[:max_panels]], len(wins)
+
+
+def _fluxmap_overview(pdf, qa, supl):
+    """Overview of qa_fluxmap for the whole run (v1.15): tile centres coloured by the local offset l
+    (flagged ones outlined), distribution of l, and l vs MJD with the nightly medians."""
+    import matplotlib.pyplot as plt
+    if "fluxmap_local_dex" not in supl.colnames or "sci_ra" not in supl.colnames:
+        return
+    by = {int(r["expnum"]): str(r["qa_fluxmap"]) for r in qa} if "qa_fluxmap" in qa.colnames else {}
+    e = np.asarray(supl["expnum"]).astype(int)
+    l = np.array([_f(x) for x in supl["fluxmap_local_dex"]])
+    ra, de = np.asarray(supl["sci_ra"], float), np.asarray(supl["sci_dec"], float)
+    mjd = np.asarray(supl["mjd"], float) if "mjd" in supl.colnames else np.full(len(e), np.nan)
+    st = np.array([by.get(int(x), "") for x in e])
+    ok = np.isfinite(l) & np.isfinite(ra) & np.isfinite(de) & (st != "UNDEFINED")
+    if ok.sum() < 3:
+        return
+    r0 = float(np.median(ra[ok]))
+    x = r0 + (ra - r0 + 180.0) % 360.0 - 180.0
+    fig = plt.figure(figsize=(11.7, 8.3))
+    a1 = fig.add_axes([0.06, 0.40, 0.88, 0.50])
+    ms = float(np.clip(6000.0 / ok.sum(), 6, 120))          # marker size: smaller for large runs
+    sc = a1.scatter(x[ok], de[ok], c=np.clip(l[ok], -0.15, 0.15), cmap="coolwarm", vmin=-0.15, vmax=0.15, s=ms,
+                    lw=0.2, edgecolors="0.7", rasterized=True)
+    for c_, z_ in (("WARNING", 3), ("MAJOR ISSUE", 4)):
+        m = ok & (st == c_)
+        a1.scatter(x[m], de[m], facecolors="none", edgecolors=CCOL[c_], s=2.5 * ms, lw=0.7, zorder=z_, rasterized=True,
+                   label=f"{c_} ({m.sum()})")
+    und = np.isfinite(ra) & np.isfinite(de) & (st == "UNDEFINED")
+    a1.scatter(x[und], de[und], marker="x", color="0.6", s=6, lw=0.5, rasterized=True, label=f"UNDEFINED ({und.sum()})")
+    a1.invert_xaxis()
+    a1.set_xlabel("RA [deg]", fontsize=8)
+    a1.set_ylabel("Dec [deg]", fontsize=8)
+    a1.tick_params(labelsize=7)
+    a1.legend(fontsize=7, loc="best")
+    cb = fig.colorbar(sc, ax=a1, pad=0.01, fraction=0.03)
+    cb.set_label("local offset l [dex]", fontsize=7)
+    cb.ax.tick_params(labelsize=6)
+    a2 = fig.add_axes([0.06, 0.07, 0.25, 0.25])
+    bins = np.linspace(-0.4, 0.4, 81)
+    a2.hist(np.clip(l[ok], bins[0], bins[-1]), bins=bins, color="0.4")
+    for t in ("warn_dex", "major_dex"):
+        v = 0.04 if t == "warn_dex" else 0.10
+        a2.axvline(v, color=CCOL["WARNING" if t == "warn_dex" else "MAJOR ISSUE"], lw=0.8)
+        a2.axvline(-v, color=CCOL["WARNING" if t == "warn_dex" else "MAJOR ISSUE"], lw=0.8)
+    a2.set_yscale("log")
+    nm = 1.4826 * np.median(np.abs(l[ok] - np.median(l[ok])))
+    a2.set_title(f"local offsets: median {np.median(l[ok]):+.3f}, NMAD {nm:.3f} dex (n={ok.sum()})", fontsize=7)
+    a2.set_xlabel("l [dex]", fontsize=7)
+    a2.tick_params(labelsize=6)
+    a3 = fig.add_axes([0.38, 0.07, 0.56, 0.25])
+    mm = ok & np.isfinite(mjd)
+    a3.plot(mjd[mm], np.clip(l[mm], -0.4, 0.4), ".", ms=2, color="0.55", rasterized=True)
+    um = np.unique(mjd[mm])
+    med = np.array([np.median(l[mm & (mjd == u)]) for u in um])
+    nn = np.array([np.sum(mm & (mjd == u)) for u in um])
+    a3.scatter(um[nn >= 3], np.clip(med[nn >= 3], -0.4, 0.4), s=10, color="#d03b3b", zorder=3, label="nightly median (>= 3 exp.)")
+    for v in (0.04, 0.10):
+        a3.axhline(v, color="0.8", lw=0.5, ls=":")
+        a3.axhline(-v, color="0.8", lw=0.5, ls=":")
+    a3.set_xlabel("MJD", fontsize=7)
+    a3.set_ylabel("l [dex]", fontsize=7)
+    a3.tick_params(labelsize=6)
+    a3.legend(fontsize=6, loc="best")
+    fig.suptitle("qa_fluxmap overview: local Halpha flux-scale offsets of all exposures", fontsize=10)
+    pdf.savefig(fig, dpi=150)
+    plt.close(fig)
+
+
+def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1, max_labels=8):
+    """Halpha maps around the flagged exposures (v1.15: windows <= 6 deg, see _fm_windows; labels
+    only for the max_labels largest |l| per panel), after an overview page (_fluxmap_overview).
 
     Regions are found from the tile centres (``coords`` = {expnum: (ra, dec)} from drpall; DAP
     fiber positions otherwise); DAP maps are read only for the exposures that are drawn (first
@@ -809,8 +1060,10 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
         return _asinh_norm(max(lw, 1e-3 * hi), 0.0, hi)
 
     gidx = np.where(good)[0]
-    groups = [gidx[g] for g in _clusters(ra0[good], de0[good])]
-    shown = groups[:max_panels]
+    stat = {i: (str(cand[i]["qa_fluxmap"]) if "qa_fluxmap" in qa.colnames else "") for i in range(len(cand))}
+    isflag = np.array([stat[i] in ("MAJOR ISSUE", "WARNING") for i in range(len(cand))])
+    shown, n_win = _fm_windows(ra0, de0, gidx, isflag, max_panels)
+    groups = [None] * n_win
     # all exposures of the shown regions are averaged in the image: read their maps (Halpha map
     # cache of the run; missing ones from the DAP files, in parallel)
     need = [int(i) for g in shown for i in g if int(i) not in pts]
@@ -829,7 +1082,8 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
     by = {int(r["expnum"]): r for r in supl}
     flagged = ("MAJOR ISSUE", "WARNING")
     sev = {"MAJOR ISSUE": 3, "WARNING": 2, "GOOD": 1}
-    stat = {i: (str(cand[i]["qa_fluxmap"]) if "qa_fluxmap" in qa.colnames else "") for i in range(len(cand))}
+    lcol = "fluxmap_local_dex" if "fluxmap_local_dex" in supl.colnames else "fluxmap_s_dex"
+    lval = {i: (_f(by[int(cand[i]["expnum"])][lcol]) if int(cand[i]["expnum"]) in by else np.nan) for i in range(len(cand))}
     for ax, g in zip(axes.flat, shown):
         g = [int(i) for i in g]
         ra_c, de_c = float(np.median(ra0[g])), float(np.median(de0[g]))
@@ -853,6 +1107,8 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
                        interpolation="none", aspect=1.0 / cos0)
         # outlines and labels only for WARNING / MAJOR pointings (repeated pointings, centres
         # < 0.05 deg apart, share one outline = worst status); outlines rasterized, text vector
+        flg = [i for i in g if stat[i] in flagged]
+        lab_ok = set(sorted(flg, key=lambda i: -abs(np.nan_to_num(lval[i])))[:max_labels])
         for sub in _clusters(ra0[g], de0[g], link=0.05):
             idx = [g[k] for k in sub]
             bad = [i for i in idx if stat[i] in flagged]
@@ -866,14 +1122,11 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
             if len(h) > 2:
                 ax.plot(np.r_[h[:, 0], h[0, 0]], np.r_[h[:, 1], h[0, 1]], color=CCOL[worst], lw=1.6,
                         rasterized=True)
-            lines = []
-            for i in bad:
-                e = int(cand[i]["expnum"])
-                col = "fluxmap_local_dex" if "fluxmap_local_dex" in supl.colnames else "fluxmap_s_dex"
-                sv = _f(by[e][col]) if e in by and col in supl.colnames else np.nan
-                lines.append(f"{e} {sv:+.3f} {stat[i][:4]}")
+            lines = [f"{int(cand[i]['expnum'])} {lval[i]:+.3f} {stat[i][:4]}" for i in bad if i in lab_ok]
+            if not lines:
+                continue
             ax.text(ra_c + (float(np.median(ra0[bad])) - ra_c + 180.0) % 360.0 - 180.0, float(np.median(de0[bad])),
-                    "\n".join(lines), ha="center", va="center", fontsize=5.5, color="k", family="monospace",
+                    "\n".join(lines), ha="center", va="center", fontsize=4.8, color="k", family="monospace",
                     bbox=dict(facecolor=CCOL[worst], alpha=0.6, lw=0, pad=1.2), clip_on=True)
         cb = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
         cb.ax.tick_params(labelsize=6)
@@ -890,14 +1143,159 @@ def _fluxmap_page(pdf, qa, supl, cfg, max_panels=6, coords=None, nproc=1):
         ax.axis("off")
     fig.legend(handles=[Line2D([], [], color=CCOL[c], lw=2, label=c) for c in flagged], loc="lower center",
                ncol=2, fontsize=7,
-               title="outline + label (expnum, local offset l [dex]) = qa_fluxmap WARNING / MAJOR pointings only;  image = "
-                     "F(Halpha) [1e-16 erg/s/cm2] (DAP NP), mean of all overlapping fibers of all exposures; asinh "
-                     "stretch, own scale per panel",
+               title=f"outline = WARNING / MAJOR pointings, label = expnum, local offset l [dex] ({max_labels} largest |l| "
+                     "per panel); image = F(Halpha) [1e-16 erg/s/cm2] (DAP NP), mean of overlapping fibers, asinh, own "
+                     "scale per panel",
                title_fontsize=7, frameon=False)
     fig.subplots_adjust(bottom=0.12)
-    extra = f" ({len(groups) - len(shown)} more regions not shown)" if len(groups) > len(shown) else ""
-    fig.suptitle("qa_fluxmap: Halpha maps of the tiles (DAP NP), fitted flux-scale offsets s and status" + extra,
+    extra = f" ({len(groups) - len(shown)} more windows not shown)" if len(groups) > len(shown) else ""
+    fig.suptitle("qa_fluxmap: Halpha maps around the flagged exposures (windows <= 6 deg, most flags first)" + extra,
                  fontsize=10)
+    pdf.savefig(fig, dpi=200)
+    plt.close(fig)
+
+
+def _gradient_page(pdf, qa, supl, cfg, n_examples=4, seed=1):
+    """qa_gradient page (v1.15). Top: Halpha maps of example exposures in the IFU frame (largest
+    significant spread among MAJOR, then WARNING, then a random GOOD one; maps from the Halpha map
+    cache / DAP files), spectrograph sectors (boundaries at IFU PA 60, 180, 300 deg; layout from the
+    fiber positions), the fitted sector offsets and the boundary jumps d12, d23, d31. Bottom: run
+    level: distribution of the spread, nightly medians of the sector offsets, and the mosaic IFU
+    dipole of qa_fluxmap (arrow towards the brighter IFU side)."""
+    import matplotlib.pyplot as plt
+    from .metrics.dap_fluxmap import halpha_map, has_halpha_map
+    from .utils.ifu_layout import assign_fibers
+    if "qa_gradient" not in qa.colnames or "gradient_spread_dex" not in supl.colnames:
+        return
+    sup = {int(r["expnum"]): r for r in supl}
+    st = {int(r["expnum"]): str(r["qa_gradient"]) for r in qa}
+    rows = {int(r["expnum"]): r for r in qa}
+    g = lambda e, k: _f(sup[e][f"gradient_{k}"]) if e in sup and f"gradient_{k}" in supl.colnames else np.nan  # noqa: E731
+    rng = random.Random(seed)
+    ex = []
+    for cls in ("MAJOR ISSUE", "WARNING", "GOOD"):
+        cand = [e for e in st if st[e] == cls and np.isfinite(g(e, "spread_dex"))
+                and has_halpha_map(cfg, int(rows[e]["tileid"]), int(rows[e]["mjd"]), e)]
+        if not cand:
+            continue
+        if cls == "GOOD":
+            ex.append((rng.choice(cand), cls))
+        else:
+            cand.sort(key=lambda e: -g(e, "spread_dex") / max(g(e, "e_spread_dex"), 1e-4))
+            ex += [(e, cls) for e in cand[:2 if cls == "MAJOR ISSUE" else 1]]
+    ex = ex[:n_examples]
+    fig = plt.figure(figsize=(11.7, 8.3))
+    W = 0.92 / max(len(ex), 1)
+    for k, (e, cls) in enumerate(ex):
+        ax = fig.add_axes([0.04 + k * W, 0.47, W * 0.86, 0.40])
+        r = rows[e]
+        try:
+            pl = halpha_map(cfg, int(r["tileid"]), int(r["mjd"]), e)
+        except Exception:  # noqa: BLE001
+            pl = None
+        if pl is None:
+            ax.axis("off")
+            continue
+        pa = _f(sup[e]["sci_pa"]) if "sci_pa" in supl.colnames else 0.0
+        lay = assign_fibers(np.asarray(pl["ra"], float), np.asarray(pl["dec"], float), np.nan_to_num(pa))
+        x, y = np.asarray(lay["x"], float) / 3600.0, np.asarray(lay["y"], float) / 3600.0
+        f = np.asarray(pl["flux"], float)
+        ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(f)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            v = np.log10(np.where(f > 0, f, np.nan))
+        lim = (-0.26, 0.26)
+        img = _fiber_image(x[ok], y[ok], v[ok], lim, lim, npix=300)
+        lo, hi = np.nanpercentile(v[ok], [3, 99]) if np.isfinite(v[ok]).any() else (0, 1)
+        im = ax.imshow(np.ma.masked_invalid(img), origin="lower", extent=(lim[0], lim[1], lim[0], lim[1]),
+                       cmap="magma", vmin=lo, vmax=hi, interpolation="none")
+        R = 0.26
+        for b in (60.0, 180.0, 300.0):     # sector boundaries (IFU PA east of north)
+            t = np.deg2rad(b)
+            ax.plot([0, R * np.sin(t)], [0, R * np.cos(t)], color="w", lw=1.0, ls="--")
+        for sp, mid in ((1, 120.0), (2, 240.0), (3, 0.0)):
+            t = np.deg2rad(mid)
+            o = g(e, f"sp{sp}_dex")
+            ax.text(0.15 * np.sin(t), 0.15 * np.cos(t), f"sp{sp}\n{o:+.3f}" if np.isfinite(o) else f"sp{sp}",
+                    color=SPEC_COL[sp], ha="center", va="center", fontsize=7, fontweight="bold",
+                    bbox=dict(facecolor="w", alpha=0.75, lw=0, pad=1))
+        for key, b in (("d12_dex", 180.0), ("d23_dex", 300.0), ("d31_dex", 60.0)):
+            t = np.deg2rad(b)
+            dv = g(e, key)
+            if np.isfinite(dv):
+                ax.text(0.235 * np.sin(t), 0.235 * np.cos(t), f"{key[:3]} {dv:+.3f}", fontsize=5.5, ha="center",
+                        va="center", color="k", bbox=dict(facecolor="w", alpha=0.75, lw=0, pad=0.8))
+        ax.set_xlim(lim[1], lim[0])        # east to the left
+        ax.set_ylim(*lim)
+        ax.set_aspect("equal")
+        ax.tick_params(labelsize=5.5)
+        ax.set_xlabel("IFU x [deg] (east for sci_pa = 0)", fontsize=6)
+        for s_ in ax.spines.values():
+            s_.set_color(CCOL[cls])
+            s_.set_linewidth(1.5)
+        ax.set_title(f"{e} {cls}: spread {g(e, 'spread_dex'):.3f}\u00b1{g(e, 'e_spread_dex'):.3f} dex\n"
+                     f"closure {g(e, 'closure_dex'):+.3f}\u00b1{g(e, 'e_closure_dex'):.3f}; "
+                     f"{int(np.nan_to_num(g(e, 'n_cross')))} pairs; PA {pa:.0f}", fontsize=6)
+        cb = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
+        cb.ax.tick_params(labelsize=5)
+        cb.set_label("log F(Halpha)", fontsize=5.5)
+    # ---- run level
+    e_all = np.array([e for e in st], int)
+    sp_ = np.array([g(e, "spread_dex") for e in e_all])
+    a1 = fig.add_axes([0.05, 0.07, 0.25, 0.28])
+    fin = np.isfinite(sp_)
+    if fin.any():
+        bins = np.linspace(0, max(0.2, float(np.nanpercentile(sp_[fin], 99.5))), 50)
+        for cls in ("GOOD", "WARNING", "MAJOR ISSUE"):
+            m = fin & np.array([st[e] == cls for e in e_all])
+            if m.any():
+                a1.hist(np.clip(sp_[m], bins[0], bins[-1]), bins=bins, color=CCOL[cls], alpha=0.8, label=f"{cls} ({m.sum()})")
+        a1.set_yscale("log")
+        for v_, c_ in ((0.04, "WARNING"), (0.10, "MAJOR ISSUE")):
+            a1.axvline(v_, color=CCOL[c_], lw=0.8, ls=":")
+        a1.legend(fontsize=5.5)
+    a1.set_xlabel("spread = max - min sector offset [dex]", fontsize=6.5)
+    a1.set_title(f"sector spread ({fin.sum()} exposures measured, {(~fin).sum()} not)", fontsize=7)
+    a1.tick_params(labelsize=6)
+    a2 = fig.add_axes([0.37, 0.07, 0.36, 0.28])
+    mjd = np.array([int(rows[e]["mjd"]) for e in e_all])
+    for sp in (1, 2, 3):
+        o = np.array([g(e, f"sp{sp}_dex") for e in e_all])
+        m = np.isfinite(o)
+        um = np.unique(mjd[m])
+        med = [np.median(o[m & (mjd == u)]) for u in um]
+        nn = np.array([np.sum(m & (mjd == u)) for u in um])
+        a2.plot(um[nn >= 3], np.array(med)[nn >= 3], ".-", ms=3, lw=0.6, color=SPEC_COL[sp], label=f"sp{sp}")
+    a2.axhline(0, color="0.7", lw=0.6)
+    a2.set_xlabel("MJD", fontsize=6.5)
+    a2.set_ylabel("nightly median offset [dex]", fontsize=6.5)
+    a2.set_title("spectrograph sector offsets per night (>= 3 exposures)", fontsize=7)
+    a2.legend(fontsize=6)
+    a2.tick_params(labelsize=6)
+    a3 = fig.add_axes([0.78, 0.07, 0.19, 0.28])
+    dp, edp, dpa = (np.nanmedian([g(e, k) for e in e_all]) for k in ("ifu_dipole_dex", "e_ifu_dipole_dex", "ifu_dipole_pa"))
+    hx = np.deg2rad(np.arange(0, 361, 60) + 30)
+    a3.plot(np.sin(hx), np.cos(hx), color="0.5", lw=1)
+    for b in (60.0, 180.0, 300.0):
+        t = np.deg2rad(b)
+        a3.plot([0, 0.87 * np.sin(t)], [0, 0.87 * np.cos(t)], color="0.8", lw=0.6, ls="--")
+    if np.isfinite(dp) and np.isfinite(dpa):
+        L = min(0.9, dp / 0.10 * 0.9)
+        t = np.deg2rad(dpa)
+        a3.annotate("", xy=(L * np.sin(t), L * np.cos(t)), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle="->", color="#d03b3b", lw=2))
+        a3.set_title(f"mosaic IFU dipole (qa_fluxmap)\n{dp:.3f}\u00b1{edp:.3f} dex towards IFU PA {dpa:.0f} deg\n"
+                     f"(arrow length: 0.10 dex = full)", fontsize=6.5)
+    else:
+        a3.set_title("mosaic IFU dipole: not fitted", fontsize=6.5)
+    a3.set_xlim(1.1, -1.1)
+    a3.set_ylim(-1.1, 1.1)
+    a3.set_aspect("equal")
+    a3.axis("off")
+    fig.suptitle("qa_gradient: Halpha flux-scale offsets of the spectrograph sectors (examples) and run overview",
+                 fontsize=10)
+    fig.text(0.04, 0.42, "examples: map = log F(Halpha) (DAP NP) in the IFU frame, dashed = sector boundaries; "
+             "sector offsets (sum 0) and boundary jumps d (log F_b/F_a across the boundary, sky structure "
+             "removed with control pairs) in dex", fontsize=6.5, color="0.3")
     pdf.savefig(fig, dpi=200)
     plt.close(fig)
 
@@ -1064,7 +1462,15 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
         log.info("diagnostics PDF: %d metric pages drawn in %.1f s", len(picked), time.time() - t0)
         t0 = time.time()
         coords = {e: (float(r.get("sci_ra", np.nan)), float(r.get("sci_dec", np.nan))) for e, r in rows.items()}
+        try:
+            _fluxmap_overview(pdf, qa, supl)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("diagnostics PDF: fluxmap overview failed: %s", exc)
         _fluxmap_page(pdf, qa, supl, cfg, coords=coords, nproc=nproc)
+        try:
+            _gradient_page(pdf, qa, supl, cfg, seed=seed)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("diagnostics PDF: qa_gradient page failed: %s", exc)
         log.info("diagnostics PDF: fluxmap page in %.1f s", time.time() - t0)
     return out
 

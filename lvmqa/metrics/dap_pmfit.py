@@ -7,6 +7,9 @@ joint model
 
     r = org_spec - mod_joint_spec_PEK      (= data - stellar - parametric lines - smooth term)
 
+(v1.15: minus a straight line through its medians in the line-free pixels of the +-30 A window,
+i.e. the residual continuum of an imperfect DAP stellar / smooth model is removed: otherwise it
+inflates fx in fibers with a bright continuum)
 is evaluated in a window centred on the line at its observed (NP) velocity,
 +- max(half_width, 3 x NP dispersion) A ([OII]3726,3729 as one window). The statistic is
 the unmodelled flux fraction (S/N independent; noise expectation removed):
@@ -33,8 +36,8 @@ import numpy as np
 
 from ..bitmask import QAFlag
 from ..registry import GROUP_DAP, Metric, ValueSpec, register
-from ._dapout import C_KMS, GAS_NP, GAS_PM, JOINT_PM, ORG, RES_NP, excess_residual, np_column, \
-    shifted_mask, sigma_window
+from ._dapout import C_KMS, GAS_NP, GAS_PM, JOINT_PM, ORG, RES_NP, excess_residual, local_baseline, \
+    np_column, shifted_mask, sigma_on
 
 # key: (NP line names summed into one window)
 BRIGHT = {
@@ -89,6 +92,7 @@ class DapPmFit(Metric):
         nsig=3.0,            # ... and only if fx > nsig * e_fx
         frac_thresh=0.10,    # fraction of poor / bad points above which the exposure is flagged
         min_points=20,
+        subtract_baseline=True,   # remove the residual continuum (line-free pixels of the window)
     )
     values = _values()
     main_value = "frac_poor"
@@ -134,8 +138,7 @@ class DapPmFit(Metric):
             if not sel.any():
                 continue
             wave, planes = ctx.dap_output(f"pm_{k}")
-            _, sig = sigma_window(ctx, wave[0], wave[-1])
-            sig = sig[:, :wave.size]
+            sig = sigma_on(ctx, wave)
             wl = [_wl(n) for n in names]
             z = vel[sel] / C_KMS
             lo, hi = min(wl) * (1 + z), max(wl) * (1 + z)
@@ -143,9 +146,15 @@ class DapPmFit(Metric):
             use = (wave[None, :] >= (lo - half)[:, None]) & (wave[None, :] <= (hi + half)[:, None])
             org = planes[ORG][sel].astype(float)
             r_pm = org - planes[JOINT_PM][sel]
-            fx, efx, chi_pm, _ = excess_residual(r_pm, sig[sel], planes[GAS_PM][sel].astype(float), use)
-            fxn, _, chi_np, _ = excess_residual(planes[RES_NP][sel].astype(float), sig[sel],
-                                                planes[GAS_NP][sel].astype(float), use)
+            gpm, gnp = planes[GAS_PM][sel].astype(float), planes[GAS_NP][sel].astype(float)
+            r_np = planes[RES_NP][sel].astype(float)
+            if p["subtract_baseline"]:
+                # v1.15: residual continuum (imperfect DAP stellar / smooth model) removed with a
+                # straight line through the line-free pixels of the window
+                r_pm, _ = local_baseline(r_pm, wave, (gpm, gnp), exclude=use)
+                r_np, _ = local_baseline(r_np, wave, (gpm, gnp), exclude=use)
+            fx, efx, chi_pm, _ = excess_residual(r_pm, sig[sel], gpm, use)
+            fxn, _, chi_np, _ = excess_residual(r_np, sig[sel], gnp, use)
             ok = np.isfinite(fx)
             signif = fx > p["nsig"] * efx
             poor = ok & signif & (fx > p["fx_warn"])

@@ -154,8 +154,8 @@ def _incomplete(m, v, flag, note):
     return fl, ", ".join(notes), {}
 
 
-@classifier("qa_lineratios", params=("min_fibers", "warn_dev_oiii", "major_dev_oiii", "warn_dev_nii", "major_dev_nii",
-                                     "warn_dev_siii", "major_dev_siii", "nsig_median", "balmer_warn_frac",
+@classifier("qa_lineratios", params=("min_fibers", "siii_soften", "warn_dev_oiii", "major_dev_oiii", "warn_dev_nii",
+                                     "major_dev_nii", "warn_dev_siii", "major_dev_siii", "nsig_median", "balmer_warn_frac",
                                      "balmer_major_frac"))
 def _lineratios(m, v, flag, note):
     from .metrics.gen_lineratios import BALMER, DOUBLETS
@@ -167,6 +167,10 @@ def _lineratios(m, v, flag, note):
         if _ok(dev) and not _ok(e):
             return None                      # run without e_dev (before v1.10): cannot re-classify
         sub[t] = m.doublet_classify(t, n, dev, e if _ok(e) else 0.0)
+    softened = False
+    if "siii" in sub:
+        sub["siii"], softened = m.siii_soften(sub["siii"], _f(v.get("siii_n")), _f(v.get("siii_dev")),
+                                              _f(v.get("siii_dev_raw")), _f(v.get("siii_e_dev_raw")))
     for t in BALMER:
         n, fb = _f(v.get(f"{t}_n")), _f(v.get(f"{t}_fbelow"))
         if not (n >= p["min_fibers"]) or not _ok(fb):
@@ -183,7 +187,10 @@ def _lineratios(m, v, flag, note):
     if not defined:
         return U, "no sub-test evaluable", upd
     bad = [t for t, f in defined.items() if f != G]
-    return _worst(*defined.values()), (("issues: " + ", ".join(f"{t}={defined[t].name}" for t in bad)) if bad else ""), upd
+    nt = ("issues: " + ", ".join(f"{t}={defined[t].name}" for t in bad)) if bad else ""
+    if softened:
+        nt += " (siii softened: uncorrected ratio consistent, Ha/Hb reddening suspect)"
+    return _worst(*defined.values()), nt, upd
 
 
 # ----------------------------------------------------------------------------- DRP
@@ -225,7 +232,10 @@ def _relflux(m, v, flag, note):
     med, e_med = _f(v.get(f"median_step_{sig}")), _f(v.get(f"e_median_step_{sig}"))
     kin, e_kin = _f(v.get(f"median_kink_{sig}")), _f(v.get(f"e_median_kink_{sig}"))
     upd = {"median_step": med, "e_median_step": e_med, "median_kink": kin, "e_median_kink": e_kin, "signal": sig}
-    fl, nt = classify(p, med, e_med, kin, e_kin, sig)
+    model = str(v.get("slope_model", "") or "").strip() or "sides"   # stored for the adopted signal
+    if "slope_model" in v and sig != str(v.get("signal", sig)).strip():
+        model = "sides"                       # signal changed by the new parameters: no stored model
+    fl, nt = classify(p, med, e_med, kin, e_kin, sig, model, _f(v.get("median_kink_raw")))
     return fl, nt, upd
 
 
@@ -530,7 +540,7 @@ def _absorption(m, v, flag, note):
     return G, nt, upd
 
 
-@classifier("qa_fluxmap", params=("warn_dex", "major_dex", "nsig"))
+@classifier("qa_fluxmap", params=("warn_dex", "major_dex", "nsig", "soften_additive", "soften_max_dex"))
 def _fluxmap(m, v, flag, note):
     from .metrics.dap_fluxmap import _note
     from .multitile.fluxmap import classify_node
@@ -542,11 +552,21 @@ def _fluxmap(m, v, flag, note):
         return None
     if not _ok(loc):          # run made before v1.13: global offset s
         loc, el = s, es
-    lab = classify_node(loc, el, int(ne), int(nr), p["warn_dex"], p["major_dex"], p["nsig"])
+    mult, add = _f(v.get("mult_dex")), _f(v.get("add_flux"))
+    mult_rel = mult - (s - loc) if _ok(mult) else math.nan
+    et = _f(v.get("e_local_tot_dex"))
+    lab, cause = classify_node(loc, et if _ok(et) else el, int(ne), int(nr), p["warn_dex"], p["major_dex"], p["nsig"], mult_rel,
+                               _f(v.get("e_mult_dex")), add, _f(v.get("e_add_flux")),
+                               bool(p.get("soften_additive", True)), with_cause=True,
+                               soften_max_dex=float(p.get("soften_max_dex", 0.2)))
     fl = {"GOOD": G, "WARNING": W, "MAJOR ISSUE": M}[lab]
+    rad = _f(v.get("local_radius_used"))
+    nn = _f(v.get("n_night"))
     nt = "" if fl == G else _note(loc, _f(v.get("n_local")) if _ok(_f(v.get("n_local"))) else 0,
-                                  m.params["local_radius"], s, nr, ne)
-    return fl, nt, {}
+                                  rad if _ok(rad) else m.params["local_radius"], s, nr, ne, cause,
+                                  _f(v.get("night_dex")) if _ok(nn) and nn >= 3 else math.nan,
+                                  _f(v.get("add_frac")), mult_rel)
+    return fl, nt, ({"cause": cause} if "cause" in v else {})
 
 
 @classifier("qa_gradient", params=("warn_dex", "major_dex", "nsig", "use_dipole"))
@@ -623,7 +643,8 @@ def _parse_notes(s: str, names) -> Dict[str, str]:
 def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Optional[str] = None,
                 metric_options: Optional[Dict[str, Dict[str, Any]]] = None, output_dir=None,
                 write: bool = True, html: bool = True, pdf: bool = False, suffix: str = "_recalculated",
-                check: bool = False, pdf_n: int = 5, pdf_seed: int = 1, nproc: int = 3, **paths):
+                check: bool = False, pdf_n: int = 5, pdf_seed: int = 1, nproc: int = 3, xlsx: bool = False,
+                html_detail: Optional[bool] = None, **paths):
     """Re-derive all flags from the stored measurements (no SFrame / DAP access); returns
     (QAResult, changes table). Writes <base><suffix>.*; the diagnostics PDF (re-reads the data of
     the plotted exposures) only if ``pdf``."""
@@ -695,11 +716,11 @@ def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Opt
     if check:
         return result, ch
     if write:
-        result.files.update(write_outputs(result, tag, suffix))
+        result.files.update(write_outputs(result, tag, suffix, xlsx=xlsx))
         out = Path(cfg.output_dir) / output_basename(cfg, tag, suffix)
         if html:
             from .report import write_html
-            result.files["html"] = write_html(result, Path(f"{out}.html"))
+            result.files["html"] = write_html(result, Path(f"{out}.html"), detail=html_detail)
         ch.write(f"{out}_changes.csv", overwrite=True)
         result.files["changes"] = Path(f"{out}_changes.csv")
         if pdf:
@@ -721,6 +742,8 @@ def main(argv=None, prog=None):
     ap.add_argument("--set", action="append", default=[], metavar="METRIC.PARAM=VALUE")
     ap.add_argument("--suffix", default="_recalculated")
     ap.add_argument("--no-html", action="store_true")
+    ap.add_argument("--html-detail", action="store_true", help="detailed per-exposure HTML also for >= 1000 exposures")
+    ap.add_argument("--xlsx", action="store_true", help="also write the XLSX copies of the tables")
     ap.add_argument("--pdf", action="store_true",
                     help="also regenerate the diagnostics PDF for the recalculated flags (re-reads the data)")
     ap.add_argument("--n", type=int, default=5, help="PDF: random exposures per status and metric")
@@ -753,7 +776,8 @@ def main(argv=None, prog=None):
     paths = {k: getattr(a, k) for k in ("redux_dir", "analysis_dir", "drpall_file", "cache_dir") if getattr(a, k)}
     res, ch = recalculate(a.drp_version, a.dap_version, tag=a.tag, metric_options=opts, output_dir=a.output_dir,
                           html=not a.no_html, pdf=a.pdf, suffix=a.suffix, check=a.check,
-                          pdf_n=a.n, pdf_seed=a.seed, nproc=a.nproc, **paths)
+                          html_detail=True if a.html_detail else None,
+                          pdf_n=a.n, pdf_seed=a.seed, nproc=a.nproc, xlsx=a.xlsx, **paths)
     from collections import Counter
     print(f"{len(ch)} flag change(s): " + ", ".join(f"{k}: {n}" for k, n in Counter(ch["metric"]).most_common()))
     if a.check:

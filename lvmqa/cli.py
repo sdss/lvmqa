@@ -79,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     og = ap.add_argument_group("output / execution")
     og.add_argument("--tag", help="suffix for output file names")
     og.add_argument("--no-html", action="store_true", help="do not write the HTML report")
+    og.add_argument("--html-detail", action="store_true",
+                    help="detailed per-exposure HTML plots also for >= 1000 exposures (default: compact layout there)")
+    og.add_argument("--xlsx", action="store_true",
+                    help="also write XLSX copies of the QA and SUPL tables (slow for large runs: ~800 SUPL columns)")
     og.add_argument("--no-pdf", action="store_true", help="do not write the diagnostics PDF")
     og.add_argument("--pdf-n", type=int, default=5, metavar="N",
                     help="diagnostics PDF: random exposures per status and metric (default 5)")
@@ -123,7 +127,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dap_n_models=args.dap_n_models, dap_target_snr=args.dap_target_snr,
         existing_only=args.existing_only, nproc=args.nproc,
         write=not args.no_write, html=not args.no_html, tag=args.tag,
-        pdf=not args.no_pdf, pdf_n=args.pdf_n, pdf_seed=args.pdf_seed,
+        pdf=not args.no_pdf, pdf_n=args.pdf_n, pdf_seed=args.pdf_seed, xlsx=args.xlsx,
+        html_detail=True if args.html_detail else None,
     )
     t = res.table
     if len(t):

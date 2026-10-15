@@ -60,6 +60,7 @@ class _WaveCal(Metric):
         major_lsf_frac=1.0,    # |offset| > major_lsf_frac * LSF -> fiber off (MAJOR level)
         frac_thresh=0.05,      # fraction of fibers above which the exposure is flagged
         min_frac_measured=0.2, # fewer measured fibers -> UNDEFINED
+        exclude=(),            # sky lines measured and reported but not used for the flag
     )
     main_value = "frac_warn"
 
@@ -83,8 +84,14 @@ class _WaveCal(Metric):
         if not ctx.has_sframe:
             return self.result(QAFlag.UNDEFINED, note="SFrame missing")
         sk = skylines(ctx)
-        names = [n for n in lines_of(self.channel) if n in sk["lines"]]
+        allnames = [n for n in lines_of(self.channel) if n in sk["lines"]]
+        names = [n for n in allnames if n not in tuple(p["exclude"])]
         vals = {}
+        for n in allnames:          # reported for all lines (also the excluded ones)
+            l_ = sk["lines"][n]
+            d = np.where(l_["ok"], l_["mu"] - l_["rest"], np.nan)
+            if np.isfinite(d).any():
+                vals[f"off_{n}"] = float(np.nanmedian(d))
         for s in (1, 2, 3):
             v = ctx.header.get(f"{self.channel.upper()}{s} WAVE SKYOFF")
             vals[f"drp_skyoff_sp{s}"] = float(v) if v is not None else float("nan")
@@ -101,9 +108,6 @@ class _WaveCal(Metric):
         n_meas = int(measured.sum())
         vals.update(n_fibers=n_meas, frac_measured=n_meas / max(len(measured), 1),
                     frac_failed=float(failed.mean()))
-        for n, d in zip(names, off):
-            if np.isfinite(d).any():
-                vals[f"off_{n}"] = float(np.nanmedian(d))
         if vals["frac_measured"] < p["min_frac_measured"]:
             return self.result(QAFlag.UNDEFINED, note=f"only {n_meas} fibers measured", **vals)
         relmax = np.max(np.where(np.isfinite(rel), rel, -np.inf), axis=0)
@@ -127,10 +131,16 @@ class _WaveCal(Metric):
         return self.result(QAFlag.GOOD, **vals)
 
 
+# z: sky8988 is not used for the flag (complex, blended line profile; v1.15)
+EXCLUDE = {"z": ("sky8988",)}
+
+
 def _make(channel, slot):
-    lines = ", ".join(f"{n[3:]}" for n in lines_of(channel))
+    excl = EXCLUDE.get(channel, ())
+    lines = ", ".join(f"{n[3:]}" for n in lines_of(channel) if n not in excl)
     cls = type(f"WaveCal_{channel}", (_WaveCal,), dict(
         name=f"qa_wavecal_{channel}", slot=slot, channel=channel,
+        defaults={**_WaveCal.defaults, "exclude": excl},
         title=f"Wavelength calibration ({channel})",
         description=(f"Wavelength calibration in the {channel} channel: centroids of bright sky lines "
                      f"({lines} A) vs. rest wavelengths, per fiber, in units of the LSF FWHM"),

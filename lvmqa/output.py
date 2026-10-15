@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from astropy.io import fits
-from astropy.table import Table
+from astropy.table import MaskedColumn, Table
 
 from . import __version__
 from .config import PipelineConfig
@@ -209,8 +209,25 @@ def _cell_value(v):
     return v
 
 
+def _column_values(col) -> list:
+    """Python values of a column (masked -> None), converted once per column."""
+    if isinstance(col, MaskedColumn) or np.ma.isMaskedArray(col):
+        data = np.ma.asarray(col)
+        vals = data.data.tolist()
+        mask = np.ma.getmaskarray(data)
+        if mask.any():
+            for k in np.where(mask)[0]:
+                vals[k] = None
+        return vals
+    return np.asarray(col).tolist()
+
+
 def _write_sheet(ws, table: Table, status_cols=(), units: bool = False,
-                 max_width: int = 48, number_format: str = "0.0000") -> None:
+                 max_width: int = 48, number_format: Optional[str] = "0.0000") -> None:
+    """Write a table to a WRITE-ONLY worksheet (rows streamed, no cell objects kept in memory).
+    Styled cells (header, units, status colours, float format) are created only where needed;
+    number_format=None writes plain numbers (large sheets)."""
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
@@ -218,37 +235,50 @@ def _write_sheet(ws, table: Table, status_cols=(), units: bool = False,
              for k, v in XLSX_FILLS.items()}
     bold = Font(bold=True)
     white_bold = Font(color="FFFFFFFF", bold=True)
+    italic = Font(italic=True, color="FF52514E")
     wrap = Alignment(vertical="top", wrap_text=True)
     status_cols = set(status_cols)
     names = list(table.colnames)
-    for j, n in enumerate(names, start=1):
-        cell = ws.cell(row=1, column=j, value=n)
-        cell.font = bold
-        cell.alignment = wrap
-    r0 = 2
-    if units:
-        for j, n in enumerate(names, start=1):
-            u = str(table[n].unit or "")
-            ws.cell(row=2, column=j, value=u).font = Font(italic=True, color="FF52514E")
-        r0 = 3
-    floats = {n for n in names if table[n].dtype.kind == "f"}
-    for i in range(len(table)):
-        for j, n in enumerate(names, start=1):
-            v = _cell_value(table[n][i])
-            cell = ws.cell(row=r0 + i, column=j, value=v)
-            if n in floats and v is not None:
-                cell.number_format = number_format
-            if n in status_cols and isinstance(v, str) and v in fills:
-                cell.fill = fills[v]
-                if v == "MAJOR ISSUE":
-                    cell.font = white_bold
+    # column widths and frozen panes must be set before the first row of a write-only sheet
     for j, n in enumerate(names, start=1):
         if table[n].dtype.kind in "UO" and len(table):
             w = max(len(n), max(len(str(x)) for x in table[n]))
         else:
             w = len(n) + 2
         ws.column_dimensions[get_column_letter(j)].width = min(max_width, max(10, w + 2))
-    ws.freeze_panes = ws.cell(row=r0, column=2)
+    r0 = 3 if units else 2
+    ws.freeze_panes = f"B{r0}"
+
+    def styled(v, font=None, fill=None, align=None, fmt=None):
+        c = WriteOnlyCell(ws, value=v)
+        if font is not None:
+            c.font = font
+        if fill is not None:
+            c.fill = fill
+        if align is not None:
+            c.alignment = align
+        if fmt is not None:
+            c.number_format = fmt
+        return c
+
+    ws.append([styled(n, font=bold, align=wrap) for n in names])
+    if units:
+        ws.append([styled(str(table[n].unit or ""), font=italic) for n in names])
+    cols = [[_cell_value(v) for v in _column_values(table[n])] for n in names]
+    kinds = [("status" if n in status_cols else ("float" if table[n].dtype.kind == "f" and number_format else ""))
+             for n in names]
+    special = [j for j, k in enumerate(kinds) if k]
+    for i in range(len(table)):
+        row = [c[i] for c in cols]
+        for j in special:
+            v = row[j]
+            if v is None:
+                continue
+            if kinds[j] == "float":
+                row[j] = styled(v, fmt=number_format)
+            elif isinstance(v, str) and v in fills:
+                row[j] = styled(v, fill=fills[v], font=white_bold if v == "MAJOR ISSUE" else None)
+        ws.append(row)
 
 
 def _write_xlsx(path: Path, sheets) -> Path:
@@ -256,8 +286,7 @@ def _write_xlsx(path: Path, sheets) -> Path:
         from openpyxl import Workbook
     except ImportError as exc:  # pragma: no cover
         raise SystemExit("openpyxl is required for the XLSX output (pip install openpyxl)") from exc
-    wb = Workbook()
-    wb.remove(wb.active)
+    wb = Workbook(write_only=True)
     for title, table, kw in sheets:
         ws = wb.create_sheet(title=title)
         _write_sheet(ws, table, **kw)
@@ -276,21 +305,23 @@ def write_xlsx_main(result, path: Path) -> Path:
 def write_xlsx_supl(result, path: Path) -> Path:
     cols = supl_columns(result)
     return _write_xlsx(path, [
-        ("SUPL", supl_table(result), dict(units=True)),
+        ("SUPL", supl_table(result), dict(units=True, number_format=None)),
         ("COLUMNS", build_columns_table(result, cols), dict(max_width=80)),
     ])
 
 
-def write_outputs(result, tag: Optional[str] = None, suffix: str = "") -> Dict[str, Path]:
+def write_outputs(result, tag: Optional[str] = None, suffix: str = "", xlsx: bool = False) -> Dict[str, Path]:
+    """FITS always; the XLSX copies (same content, for visual inspection) only if xlsx=True:
+    the supplementary sheet has ~800 columns, i.e. millions of cells for large runs."""
     # NB: no Path.with_suffix() - the DAP version contains dots
     base = Path(result.config.output_dir) / output_basename(result.config, tag, suffix)
     base.parent.mkdir(parents=True, exist_ok=True)
-    return {
-        "fits": write_fits_main(result, Path(f"{base}.fits")),
-        "xlsx": write_xlsx_main(result, Path(f"{base}.xlsx")),
-        "fits_supl": write_fits_supl(result, Path(f"{base}_supl.fits")),
-        "xlsx_supl": write_xlsx_supl(result, Path(f"{base}_supl.xlsx")),
-    }
+    out = {"fits": write_fits_main(result, Path(f"{base}.fits")),
+           "fits_supl": write_fits_supl(result, Path(f"{base}_supl.fits"))}
+    if xlsx:
+        out["xlsx"] = write_xlsx_main(result, Path(f"{base}.xlsx"))
+        out["xlsx_supl"] = write_xlsx_supl(result, Path(f"{base}_supl.xlsx"))
+    return out
 
 
 def read_qa_fits(path) -> Dict[str, Table]:

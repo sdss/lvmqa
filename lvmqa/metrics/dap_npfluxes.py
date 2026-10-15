@@ -19,7 +19,9 @@ SFrame SKY extension) are not evaluated (status -2): sky-subtraction residuals, 
 model, would dominate the net residual (e.g. [FeII]8617 in the OH / O2 (0-1) forest).
 
 For each group the fibers with summed NP S/N >= ``min_snr`` (3) are selected; residual
-r = data - joint model (NP: res_joint_spec; PM: org - mod_joint_spec_PEK) and the line model
+r = data - joint model (NP: res_joint_spec; PM: org - mod_joint_spec_PEK; v1.15: minus a
+straight line through its medians in the line-free pixels of the +-25 A margin, so that an
+imperfect DAP continuum under the window does not count as line flux) and the line model
 are shifted to the rest frame with the Halpha NP velocity (integer pixels) and summed:
 
     net = sum(r) / sum(model)   over the window:  > 0 flux missed, < 0 flux over-predicted
@@ -43,7 +45,7 @@ import numpy as np
 
 from ..bitmask import QAFlag
 from ..registry import GROUP_DAP, Metric, ValueSpec, register
-from ._dapout import C_KMS, GAS_NP, GAS_PM, JOINT_PM, ORG, RES_NP, np_column, sigma_window
+from ._dapout import C_KMS, GAS_NP, GAS_PM, JOINT_PM, ORG, RES_NP, local_baseline, np_column, sframe_on, sigma_on
 
 from ._lines import BRIGHT_GROUPS, FAINT_GROUPS
 
@@ -96,6 +98,7 @@ class FaintLines(Metric):
         clip=5.0,            # per-fiber residual-sum clipping (x NMAD)
         frac_poor_warn=0.25, frac_bad_major=0.5,
         sky_max=5.0,         # stacked sky / stacked line model in the window above -> not evaluated
+        subtract_baseline=True,  # remove the residual continuum (line-free pixels around the window)
     )
     values = _values()
     main_value = "max_abs_net"
@@ -159,10 +162,8 @@ class FaintLines(Metric):
             if sel.size < p["min_fibers"]:
                 continue
             wave, planes = ctx.dap_output(f"fl_{k}")
-            _, sig = sigma_window(ctx, wave[0], wave[-1])
-            sig = sig[:, :wave.size]
-            _, sky = ctx.dap_sframe_window("SKY", wave[0], wave[-1])
-            sky = sky[:, :wave.size]
+            sig = sigma_on(ctx, wave)
+            sky = sframe_on(ctx, "SKY", wave)
             if self._use_pm(ctx, prim):
                 r = planes[ORG][sel].astype(float) - planes[JOINT_PM][sel]
                 g = planes[GAS_PM][sel].astype(float)
@@ -173,6 +174,12 @@ class FaintLines(Metric):
             x = np.arange(int(np.ceil((w0 - wave[0]) / dw)), int(np.floor((w1 - wave[0]) / dw)) + 1)
             sh = np.round(0.5 * (w0 + w1) * v[sel] / C_KMS / dw).astype(int)
             idx = sh[:, None] + x[None, :]
+            if p["subtract_baseline"]:
+                # v1.15: residual continuum under the window (imperfect DAP continuum) removed: straight
+                # line through the line-free pixels of the +-25 A margin
+                win = np.zeros(r.shape, bool)
+                np.put_along_axis(win, np.clip(idx, 0, wave.size - 1), True, axis=1)
+                r, _ = local_baseline(r, wave, (g, planes[GAS_NP][sel], planes[GAS_PM][sel]), exclude=win)
             inside = (idx.min(axis=1) >= 0) & (idx.max(axis=1) < wave.size)
             idx = np.clip(idx, 0, wave.size - 1)
             rr = np.take_along_axis(r, idx, axis=1)

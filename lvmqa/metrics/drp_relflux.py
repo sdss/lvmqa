@@ -31,6 +31,20 @@ Telluric bands are excluded (O2 A 7590-7710, H2O 7150-7350, O2 B 6860-6940 A). T
             shape (b-r +0.04...+0.13, r-z +0.16...+0.37 on DRP 1.3.2), so at most WARNING at b-r
             and not used at r-z (UNDEFINED without bright fibers).
 
+v1.15:
+  * the ``edge`` = 100 A of each side window next to the boundary (b-r 5675-5775 | 5825-5925,
+    r-z 7420-7520 | 7740-7840 A) are used only for the step (levels at x0: median of the 10-A
+    bin medians in the zone projected to x0 with the side slope), the slopes come from the outer
+    parts (b-r 5525-5675 | 5925-6075, r-z 6950-7420 | 7840-8100 A): near the boundary a step or a
+    stitching artefact otherwise biases the gradients.
+  * slope-mismatch veto on the stack of the adopted signal (slope_model()): straight lines through
+    the 10-A bin medians of the stack in the outer windows; the scatter of the bin medians about
+    them (absorption features, residual lines, outliers) gives the error of the stack slope
+    mismatch. If it is not significant (|K_stack| <= stack_nsig x e_K), one common continuum slope
+    (inverse-variance weighted: the cleaner side dominates) explains both sides: slope_model =
+    'joint', the slope mismatch is not counted (median_kink_raw, K_stack reported) and the step is
+    measured with the common slope. Typical case: one side window biased by absorption features.
+
 DR20 statistic (still reported, values *_dr20; scripts/continuum/DRPCubeQA.py):
 
 Per science fiber, FLUX + SKY in [blue_win[0] - margin, red_win[1] + margin] is sigma-clipped
@@ -172,24 +186,124 @@ def fit_mask(w, line_mask, extra=()):
     return lm
 
 
-def boundary_shape(w, y, overlap, blue, red, line_mask, lever=250.0, extra=()):
-    """Per-row continuum shape at the overlap from straight lines through the bin medians of the
-    unmasked pixels of the blue and red side windows (level a, slope b at the overlap centre x0):
+def zones(blue, red, edge):
+    """Slope windows and jump zones (v1.15): the ``edge`` A of each side next to the boundary are
+    used only for the levels (jump), the rest of the side window only for the slopes."""
+    return dict(blue_slope=(blue[0], blue[1] - edge), red_slope=(red[0] + edge, red[1]),
+                blue_zone=(blue[1] - edge, blue[1]), red_zone=(red[0], red[0] + edge))
+
+
+def _common_slope(xb, Yb, xr, Yr):
+    """Per row: one slope for both sides with separate intercepts (least squares on the bins)."""
+    num = np.zeros(Yb.shape[0])
+    den = np.zeros(Yb.shape[0])
+    for x, Y in ((xb, Yb), (xr, Yr)):
+        ok = np.isfinite(Y)
+        W = ok.astype(float)
+        n = np.maximum(W.sum(1), 1)
+        xm = (W * x).sum(1) / n
+        ym = np.where(ok, Y, 0.0).sum(1) / n
+        dx = np.where(ok, x[None, :] - xm[:, None], 0.0)
+        num += (dx * np.where(ok, Y - ym[:, None], 0.0)).sum(1)
+        den += (dx ** 2).sum(1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return num / den
+
+
+def slope_model(w, stack, mb, mr, x0, lever=250.0, nsig=3.0, binw=10.0, min_bins=4):
+    """
+    Is the slope mismatch real at the level of the stacked normalised spectrum (v1.15)?
+    Straight lines through the 10-A bin medians of the stack in the two outer slope windows; the
+    scatter of the bin medians about each line (1.4826 MAD: absorption features, residual lines,
+    outliers) gives the slope errors, hence the error of the stack slope mismatch
+        K_stack = (b_r - b_b) * lever / level,  e_K = lever / level * sqrt(e_b_blue^2 + e_b_red^2).
+    If |K_stack| <= nsig * e_K, one common continuum slope explains both sides within their scatter
+    (typically one side's slope is biased by absorption features / outliers): model 'joint', with
+    the common slope = inverse-variance weighted mean of the side slopes (weights w_blue, 1 - w_blue:
+    the cleaner side dominates). Otherwise 'sides'. Returns (model, info dict).
+    """
+    xb, Yb = _binned(w, stack[None, :], mb, binw)
+    xr, Yr = _binned(w, stack[None, :], mr, binw)
+    if xb.size < min_bins or xr.size < min_bins:
+        return "sides", {}
+    Yb, Yr = Yb[0], Yr[0]
+    okb, okr = np.isfinite(Yb), np.isfinite(Yr)
+    if okb.sum() < min_bins or okr.sum() < min_bins:
+        return "sides", {}
+    out = {}
+    for name, x, Y in (("blue", xb[okb] - x0, Yb[okb]), ("red", xr[okr] - x0, Yr[okr])):
+        c = np.polyfit(x, Y, 1)
+        res = Y - np.polyval(c, x)
+        sig = max(1.4826 * float(np.median(np.abs(res - np.median(res)))), 1e-4)
+        sxx = float(np.sum((x - x.mean()) ** 2))
+        out[name] = (float(c[0]), float(c[1]), sig, sig / np.sqrt(sxx), sxx)
+    (bb, ab, sb, eb, xxb), (br, ar, sr, er, xxr) = out["blue"], out["red"]
+    lev = 0.5 * (ab + ar)
+    if not lev > 0:
+        return "sides", {}
+    K = (br - bb) * lever / lev
+    eK = lever / lev * np.hypot(eb, er)
+    wb = (1 / eb ** 2) / (1 / eb ** 2 + 1 / er ** 2)
+    info = dict(K_stack=float(K), e_K_stack=float(eK), w_blue=float(wb), scat_blue=sb, scat_red=sr)
+    return ("joint" if abs(K) <= nsig * eK else "sides"), info
+
+
+def boundary_shape(w, y, overlap, blue, red, line_mask, lever=250.0, extra=(), edge=100.0, model="sides",
+                   w_blue=None, binw=10.0, min_bins=4, zone_min_bins=3):
+    """Per-row continuum shape at the overlap (v1.15).
+    Slopes from straight lines through the 10-A bin medians of the unmasked pixels of the outer
+    side windows (side window minus the ``edge`` A next to the boundary); levels at the overlap
+    centre x0 from the jump zones (the ``edge`` A next to the boundary: median of the bin medians
+    projected to x0 with the side slope; if a zone has < zone_min_bins bins, e.g. r-z red zone in
+    the O2 A band, the side line extrapolated to x0). ``model`` (see slope_model): 'sides' = each
+    side its own slope; 'joint' = one slope for both sides, w_blue x b_blue + (1 - w_blue) x b_red
+    (slope mismatch 0).
       J = (a_r - a_b) / level              fractional step at x0
-      K = (b_r - b_b) * lever / level      slope mismatch: divergence of the side lines `lever` A from x0
+      K = (b_r - b_b) * lever / level      slope mismatch with the adopted model (0 unless 'sides')
+      K_raw                                slope mismatch of the side lines
       G = (b_b + b_r) / 2 * 100 / level    common gradient per 100 A
-    with level = (a_b + a_r) / 2. Returns dict(J, K, G, npix_blue, npix_red)."""
+    with level = (a_b + a_r) / 2. Returns dict(J, K, K_raw, G, npix_blue, npix_red, zones)."""
+    z = zones(blue, red, edge)
     with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
         warnings.simplefilter("ignore", RuntimeWarning)
         lm = fit_mask(w, line_mask, extra)
-        mb = (w >= blue[0]) & (w <= blue[1]) & ~lm
-        mr = (w >= red[0]) & (w <= red[1]) & ~lm
+
+        def win(a):
+            return (w >= a[0]) & (w <= a[1]) & ~lm
+
+        mb, mr = win(z["blue_slope"]), win(z["red_slope"])
+        zb, zr = win(z["blue_zone"]), win(z["red_zone"])
         x0 = 0.5 * (overlap[0] + overlap[1])
-        (ab, bb), (ar, br) = _side_line(w, y, mb, x0), _side_line(w, y, mr, x0)
+        (ab0, bb), (ar0, br) = _side_line(w, y, mb, x0, binw, min_bins), _side_line(w, y, mr, x0, binw, min_bins)
+        k_raw_slopes = (bb, br)
+        if model != "sides":
+            xb, Yb = _binned(w, y, mb, binw)
+            xr, Yr = _binned(w, y, mr, binw)
+            wb = 0.5 if w_blue is None or not np.isfinite(w_blue) else float(w_blue)
+            sl = np.where(np.isfinite(bb) & np.isfinite(br), wb * bb + (1 - wb) * br, np.where(np.isfinite(bb), bb, br))
+            bb_m = br_m = sl
+            # side levels at x0 with the common slope (fallback when a zone is empty)
+            ab0 = np.nanmedian(Yb - sl[:, None] * (xb - x0)[None, :], axis=1) if xb.size else ab0
+            ar0 = np.nanmedian(Yr - sl[:, None] * (xr - x0)[None, :], axis=1) if xr.size else ar0
+        else:
+            bb_m, br_m = bb, br
+
+        def zone_level(m, slope, fallback):
+            x, Y = _binned(w, y, m, binw)
+            if x.size < zone_min_bins:
+                return fallback
+            lvl = np.nanmedian(Y - slope[:, None] * (x - x0)[None, :], axis=1)
+            nb = np.isfinite(Y).sum(1)
+            return np.where(nb >= zone_min_bins, lvl, fallback)
+
+        ab = zone_level(zb, bb_m, ab0)
+        ar = zone_level(zr, br_m, ar0)
         lev = 0.5 * (ab + ar)
         lev = np.where(lev > 0, lev, np.nan)
-        return dict(J=(ar - ab) / lev, K=(br - bb) * lever / lev, G=0.5 * (bb + br) * 100.0 / lev,
-                    npix_blue=int(mb.sum()), npix_red=int(mr.sum()))
+        return dict(J=(ar - ab) / lev, K=(br_m - bb_m) * lever / lev,
+                    K_raw=(k_raw_slopes[1] - k_raw_slopes[0]) * lever / lev,
+                    G=0.5 * (bb_m + br_m) * 100.0 / lev,
+                    npix_blue=int(mb.sum() + zb.sum()), npix_red=int(mr.sum() + zr.sum()), zones=z)
 
 
 def boundary_jumps(w, y, overlap, blue, red, line_mask, extra=()):
@@ -209,9 +323,11 @@ def robust_median(v, min_n=5):
     return med, float(1.2533 * 1.4826 * np.median(np.abs(v - med)) / np.sqrt(v.size)), int(v.size)
 
 
-def classify(p, step, e_step, kink, e_kink, signal):
+def classify(p, step, e_step, kink, e_kink, signal, model="sides", kink_raw=np.nan):
     """Flag from the adopted step / slope mismatch (shared by compute() and lvmqa.recalc).
-    A component counts only if it exceeds its threshold AND nsig x its error. Returns (flag, note)."""
+    A component counts only if it exceeds its threshold AND nsig x its error. ``model`` != 'sides':
+    the side slopes differ (kink_raw) but one common continuum slope explains both sides (stack),
+    so the slope mismatch does not count. Returns (flag, note)."""
     def level(x, ex, warn, major):
         if not np.isfinite(x):
             return 0
@@ -220,13 +336,17 @@ def classify(p, step, e_step, kink, e_kink, signal):
             return 0
         return 2 if abs(x) > major else (1 if abs(x) > warn else 0)
 
+    model = str(model).strip() or "sides"
     ls = level(step, e_step, p["step_warn"], p["step_major"])
-    lk = level(kink, e_kink, p["kink_warn"], p["kink_major"])
+    lk = level(kink, e_kink, p["kink_warn"], p["kink_major"]) if model == "sides" else 0
     lvl = max(ls, lk)
     parts = [f"step {step:+.1%}" + (f" +- {e_step:.1%}" if np.isfinite(e_step) else "")]
-    if np.isfinite(kink):
+    if model == "sides" and np.isfinite(kink):
         parts.append(f"slope mismatch {kink:+.1%} at +-{p['lever']:.0f} A" +
                      (f" +- {e_kink:.1%}" if np.isfinite(e_kink) else ""))
+    elif model != "sides":
+        parts.append(f"side slopes differ by {kink_raw:+.1%} at +-{p['lever']:.0f} A, not significant against "
+                     f"the scatter of the stacked spectrum (common slope adopted, not counted)")
     note = ", ".join(parts) + f" ({signal})"
     if lvl and ls == 0:
         note += "; slope mismatch"
@@ -237,6 +357,24 @@ def classify(p, step, e_step, kink, e_kink, signal):
     if signal == "obs":
         return (QAFlag.WARNING if lvl == 2 else QAFlag.GOOD), note + " (sky-dominated signal: at most WARNING)"
     return (QAFlag.MAJOR, QAFlag.WARNING, QAFlag.GOOD)[2 - lvl], note
+
+
+def _shape(w, y, stack, lm, p):
+    """boundary_shape with the slope model decided on the stack (v1.15)."""
+    ov, blue, red = p["overlap"], p["blue_side"], p["red_side"]
+    extra = tuple(p.get("mask_windows", ()))
+    edge = p.get("edge", 0.0)
+    z = zones(blue, red, edge)
+    x0 = 0.5 * (ov[0] + ov[1])
+    model, dev = "sides", {}
+    if p.get("stack_nsig", 0) and stack is not None:
+        lmf = fit_mask(w, lm, extra)
+        mb = (w >= z["blue_slope"][0]) & (w <= z["blue_slope"][1]) & ~lmf
+        mr = (w >= z["red_slope"][0]) & (w <= z["red_slope"][1]) & ~lmf
+        model, dev = slope_model(w, stack, mb, mr, x0, p.get("lever", 250.0), p["stack_nsig"])
+    r = boundary_shape(w, y, ov, blue, red, lm, p.get("lever", 250.0), extra, edge, model, dev.get("w_blue"))
+    r.update(model=model, dev=dev)
+    return r
 
 
 def measure_steps(ctx, p):
@@ -254,12 +392,13 @@ def measure_steps(ctx, p):
         Go = np.nanmedian(obs / np.nanmedian(obs, axis=1)[:, None], axis=0)
         lm_obs = line_mask_from(w, Go, p["mask_obs"])
         extra = tuple(p.get("mask_windows", ()))
-        so = boundary_shape(w, obs, ov, blue, red, lm_obs, p.get("lever", 250.0), extra)
-        out.update(J_obs=so["J"], K_obs=so["K"], G_obs=so["G"], npix_blue=so["npix_blue"],
-                   npix_red=so["npix_red"], stack_obs=Go, mask_obs=lm_obs, extra_mask=extra)
+        so = _shape(w, obs, Go, lm_obs, p)
+        out.update(J_obs=so["J"], K_obs=so["K"], Kraw_obs=so["K_raw"], G_obs=so["G"], model_obs=so["model"],
+                   dev_obs=so["dev"], npix_blue=so["npix_blue"], npix_red=so["npix_red"], stack_obs=Go,
+                   mask_obs=lm_obs, extra_mask=extra, zones=so["zones"])
         snr = np.nanmedian(np.where(good & ~lm_obs[None, :], f * np.sqrt(np.where(good, iv, 0.0)), np.nan), axis=1)
         src = snr >= p["min_snr_src"]
-        out["J_src"] = out["K_src"] = out["G_src"] = np.array([])
+        out["J_src"] = out["K_src"] = out["Kraw_src"] = out["G_src"] = np.array([])
         if src.sum() >= 5:
             fs_ = np.where(good, f, np.nan)[src]
             norm = np.nanmedian(fs_, axis=1)[:, None]
@@ -269,9 +408,10 @@ def measure_steps(ctx, p):
             # residuals add noise) and emission lines in the source stack (> mask_src above its
             # envelope); independent of the source brightness (nebular fibers in bright HII fields)
             lm_src = line_mask_from(w, skyrel, p["mask_sky"]) | line_mask_from(w, Gs, p["mask_src"])
-            ss = boundary_shape(w, fs_, ov, blue, red, lm_src, p.get("lever", 250.0), extra)
-            out.update(J_src=ss["J"], K_src=ss["K"], G_src=ss["G"], npix_blue_src=ss["npix_blue"],
-                       npix_red_src=ss["npix_red"], stack_src=Gs, mask_src=lm_src, n_src_sel=int(src.sum()))
+            ss = _shape(w, fs_, Gs, lm_src, p)
+            out.update(J_src=ss["J"], K_src=ss["K"], Kraw_src=ss["K_raw"], G_src=ss["G"], model_src=ss["model"],
+                       dev_src=ss["dev"], npix_blue_src=ss["npix_blue"], npix_red_src=ss["npix_red"],
+                       stack_src=Gs, mask_src=lm_src, n_src_sel=int(src.sum()))
     return out
 
 
@@ -286,6 +426,11 @@ class _RelFluxBase(Metric):
         ValueSpec("median_kink", "f8", "", "Median slope mismatch: divergence of the side continua at +-lever A (fraction)"),
         ValueSpec("e_median_kink", "f8", "", "Error of median_kink"),
         ValueSpec("median_gradient", "f8", "", "Median common continuum gradient (fraction per 100 A)"),
+        ValueSpec("median_kink_raw", "f8", "", "Median slope mismatch of the individual side lines (before the slope-model veto)"),
+        ValueSpec("slope_model", "U5", "", "Continuum slope model adopted on the stack: sides (own slopes) or joint "
+                                           "(mismatch not significant against the bin scatter: not counted)"),
+        ValueSpec("kink_stack", "f8", "", "Slope mismatch of the stacked spectrum (outer windows)"),
+        ValueSpec("e_kink_stack", "f8", "", "Error of kink_stack from the scatter of the 10-A bin medians"),
         ValueSpec("signal", "U4", "", "Adopted signal: src (FLUX, fibers with continuum S/N >= 5) or obs (FLUX+SKY, all)"),
         ValueSpec("median_step_obs", "f8", "", "Median step, FLUX+SKY of all good science fibers"),
         ValueSpec("e_median_step_obs", "f8", "", "Error of median_step_obs"),
@@ -366,18 +511,22 @@ class _RelFluxBase(Metric):
             vals.update(median_step_src=m_, e_median_step_src=e_, median_kink_src=k_, e_median_kink_src=ek_,
                         n_src=n_)
         if fs.sum() >= p["min_src"]:
-            J, K, G, sig = Js, r_["K_src"], r_["G_src"], "src"
+            sig = "src"
         elif "median_step_obs" in vals and p["obs_fallback"]:
-            J, K, G, sig = Jo, r_["K_obs"], r_["G_obs"], "obs"
+            sig = "obs"
         else:
             return self.result(QAFlag.UNDEFINED, note="too few continuum pixels / fibers", **vals)
+        J, K, Kr, G, model = r_[f"J_{sig}"], r_[f"K_{sig}"], r_[f"Kraw_{sig}"], r_[f"G_{sig}"], r_[f"model_{sig}"]
         med, e_med, _ = robust_median(J)
         kin, e_kin, _ = robust_median(K)
         gra = robust_median(G)[0]
         Jf = J[np.isfinite(J)]
         vals.update(median_step=med, e_median_step=e_med, nmad_step=float(1.4826 * np.median(np.abs(Jf - med))),
-                    median_kink=kin, e_median_kink=e_kin, median_gradient=gra, signal=sig)
-        flag, note = classify(p, med, e_med, kin, e_kin, sig)
+                    median_kink=kin, e_median_kink=e_kin, median_gradient=gra, signal=sig,
+                    median_kink_raw=robust_median(Kr)[0], slope_model=model,
+                    kink_stack=r_.get(f"dev_{sig}", {}).get("K_stack", np.nan),
+                    e_kink_stack=r_.get(f"dev_{sig}", {}).get("e_K_stack", np.nan))
+        flag, note = classify(p, med, e_med, kin, e_kin, sig, model, vals["median_kink_raw"])
         return self.result(flag, note=note, **vals)
 
 
@@ -386,6 +535,8 @@ _COMMON = dict(fit_margin=300.0, poly_order=2, clip_sigma=3.0, clip_iters=10,
                step_warn=0.03, step_major=0.08, min_snr_src=5.0, min_src=10, min_fibers=50, min_pix=40,
                kink_warn=0.05, kink_major=0.10,  # slope mismatch (divergence of the side continua at +-lever A)
                lever=250.0, nsig=3.0,            # lever arm [A]; significance of step / slope mismatch
+               edge=100.0,      # v1.15: A next to the boundary used only for the levels (step), not the slopes
+               stack_nsig=2.0,  # v1.15: slope mismatch must also be significant on the stack (slope_model); 0 = off
                mask_windows=(),                  # extra masked wavelength windows (A)
                mask_obs=0.10,   # obs: pixels > 10% above the running 20th percentile of the median spectrum
                mask_src=0.10,   # src: emission lines > 10% above the envelope of the source stack
