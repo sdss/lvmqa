@@ -707,9 +707,13 @@ def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Opt
     rows = supl[[c for c in ID_COLUMNS if c in supl.colnames]]
     table = build_table(rows, recs, mlist, cfg)
     table.meta.update({k: v for k, v in qa.meta.items() if k in ("RUNTIME",)})
+    from .diagnostics import _inputs_from_header
+    _inputs_from_header(cfg, base)   # carry the non-standard inputs (SFrame pattern etc.) over
     result = QAResult(table=table, metrics=mlist, config=cfg,
                       selection={"recalculated_from": f"{base.name}.fits",
-                                 "overrides": str(metric_options or {})})
+                                 "overrides": str(metric_options or {}),
+                                 "sframe_pattern": cfg.sframe_pattern or "", "no_dap": cfg.no_dap,
+                                 "no_drpall": cfg.no_drpall})
     ch = Table(rows=changes, names=("expnum", "metric", "old", "new"),
                dtype=("i8", "U24", "U12", "U12")) if changes else \
         Table(names=("expnum", "metric", "old", "new"), dtype=("i8", "U24", "U12", "U12"))

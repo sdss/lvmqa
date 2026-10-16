@@ -162,6 +162,11 @@ def _primary(result, kind: str) -> fits.PrimaryHDU:
     for key, name in (("expnums", "SELEXP"), ("mjds", "SELMJD"), ("tileids", "SELTILE")):
         h[name] = (to_ascii(",".join(map(str, sel.get(key, []))) or "all")[:68], f"{key} selection")
     h["RUNTIME"] = (result.table.meta.get("RUNTIME", -1), "[s] pipeline run time")
+    # non-standard inputs (v1.15): needed again by the diagnostics PDF of a recalculation
+    if sel.get("sframe_pattern"):
+        h["SFPATT"] = (to_ascii(str(sel["sframe_pattern"])), "SFrame file pattern ({expnum} placeholder)")
+    h["NODAP"] = (bool(sel.get("no_dap", getattr(cfg, "no_dap", False))), "run without DAP products")
+    h["NODRPALL"] = (bool(sel.get("no_drpall", getattr(cfg, "no_drpall", False))), "exposures from SFrame headers")
     return prim
 
 

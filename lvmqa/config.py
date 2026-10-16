@@ -67,6 +67,11 @@ class PipelineConfig:
     dap_target_snr: int = DEFAULT_DAP_TARGET_SNR
     # per-metric parameter overrides: {"qa_fit_consistency": {"min_snr": 3}, ...}
     metric_options: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # non-standard input layout (v1.15): SFrame file pattern with an {expnum} placeholder (glob
+    # wildcards allowed, zero-padding of the expnum irrelevant), e.g. "/data/test/SFrame-*-{expnum}.fits"
+    sframe_pattern: Optional[str] = None
+    no_dap: bool = False       # no DAP products: DAP-based metrics are UNDEFINED
+    no_drpall: bool = False    # no drpall: exposure table from the SFrame primary headers
 
     def __post_init__(self) -> None:
         self.dap_version = normalize_dap_version(self.dap_version)

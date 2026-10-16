@@ -74,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--drpall", help="drpall file (default: <redux>/<drpver>/drpall-<drpver>.fits)")
     pg.add_argument("--output-dir", help="output directory (default: $LVM_QA_OUTPUT_DIR or dev path)")
     pg.add_argument("--cache-dir", help="cache directory (default: <output-dir>/cache)")
+    pg.add_argument("--sframe-pattern", metavar="PATTERN",
+                    help="SFrames of a non-standard layout: path pattern with an {expnum} placeholder, glob "
+                         "wildcards allowed, zero-padding of the expnum irrelevant; quote it, e.g. "
+                         "'/data/test/SFrame-*-{expnum}.fits'")
+    pg.add_argument("--no-dap", action="store_true",
+                    help="no DAP products: DAP-based metrics are UNDEFINED (not searched for)")
+    pg.add_argument("--no-drpall", action="store_true",
+                    help="no drpall: exposure table from the SFrame primary headers (automatic with "
+                         "--sframe-pattern if the drpall file does not exist)")
     pg.add_argument("--dap-n-models", type=int, default=108)
     pg.add_argument("--dap-target-snr", type=int, default=20)
     og = ap.add_argument_group("output / execution")
@@ -129,6 +138,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write=not args.no_write, html=not args.no_html, tag=args.tag,
         pdf=not args.no_pdf, pdf_n=args.pdf_n, pdf_seed=args.pdf_seed, xlsx=args.xlsx,
         html_detail=True if args.html_detail else None,
+        sframe_pattern=args.sframe_pattern, no_dap=args.no_dap, no_drpall=args.no_drpall,
     )
     t = res.table
     if len(t):

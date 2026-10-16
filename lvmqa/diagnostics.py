@@ -1167,6 +1167,8 @@ def _gradient_page(pdf, qa, supl, cfg, n_examples=4, seed=1):
     from .utils.ifu_layout import assign_fibers
     if "qa_gradient" not in qa.colnames or "gradient_spread_dex" not in supl.colnames:
         return
+    if not np.isfinite(np.array([_f(v) for v in supl["gradient_spread_dex"]], float)).any():
+        return
     sup = {int(r["expnum"]): r for r in supl}
     st = {int(r["expnum"]): str(r["qa_gradient"]) for r in qa}
     rows = {int(r["expnum"]): r for r in qa}
@@ -1361,6 +1363,20 @@ def _criteria_text(metric, cfg, width=190) -> str:
     return "\n".join(lines)
 
 
+def _inputs_from_header(cfg, base) -> None:
+    """Non-standard inputs of the run (SFrame pattern, no DAP, no drpall; v1.15) from the primary
+    header of <base>.fits, unless already set in cfg."""
+    try:
+        from astropy.io import fits
+        h = fits.getheader(f"{base}.fits", 0)
+    except Exception:  # noqa: BLE001
+        return
+    if not cfg.sframe_pattern and h.get("SFPATT"):
+        cfg.sframe_pattern = str(h["SFPATT"])
+    cfg.no_dap = bool(cfg.no_dap or h.get("NODAP", False))
+    cfg.no_drpall = bool(cfg.no_drpall or h.get("NODRPALL", False))
+
+
 def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=None, suffix="",
              metric_options=None, **paths) -> Path:
     """Diagnostics PDF from the written tables <base><suffix>.fits / _supl.fits (re-reads the data of
@@ -1375,13 +1391,14 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
     paths = {k: v for k, v in paths.items() if v is not None}
     cfg = PipelineConfig(drp_version=drp_version, dap_version=dap_version,
                          metric_options=dict(metric_options or {}), **paths)
+    _inputs_from_header(cfg, Path(cfg.output_dir) / output_basename(cfg, tag, suffix))
     base = Path(cfg.output_dir) / output_basename(cfg, tag, suffix)
     if not Path(f"{base}.fits").is_file():
         raise FileNotFoundError(f"{base}.fits not found (check --output-dir / --tag / --suffix)")
     qa = Table.read(f"{base}.fits", hdu="QA")
     supl = Table.read(f"{base}_supl.fits", hdu="SUPL")
-    from .pipeline import load_drpall, select_exposures, _row_to_dict
-    drpall = load_drpall(cfg)
+    from .pipeline import exposure_table, select_exposures, _row_to_dict
+    drpall = exposure_table(cfg, list(qa["expnum"]), nthreads=max(16, 2 * nproc))
     rows = {int(r["expnum"]): _row_to_dict(r) for r in select_exposures(drpall, list(qa["expnum"]))}
     sup = {int(r["expnum"]): {c: r[c] for c in supl.colnames} for r in supl}
     # Example selection. Every plotted exposure costs a full read (SFrame windows, DAP tables and

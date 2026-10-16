@@ -59,6 +59,100 @@ def load_drpall(cfg: PipelineConfig) -> Table:
     return t
 
 
+# drpall column <- SFrame primary-header keyword(s) (lvmdrp.utils.metadata._collect_header_data, plus
+# the raw-frame keywords for tileid / mjd / expnum / exptime). Used without a drpall file (v1.15).
+HEADER_COLUMNS = {
+    "expnum": ("EXPOSURE",), "tileid": ("TILE_ID", "TILEID"), "mjd": ("MJD", "SMJD"), "exptime": ("EXPTIME",),
+    "object": ("OBJECT",), "obstime": ("OBSTIME",), "dpos": ("DPOS",), "drpver": ("DRPVER",),
+    "drpqual": ("DRPQUAL",), "fluxcal": ("FLUXCAL",),
+    "sci_ra": ("SCIRA", "POSCIRA"), "sci_dec": ("SCIDEC", "POSCIDE"), "sci_pa": ("SCIPA", "POSCIPA"),
+    "sci_amass": ("SCIAM",), "sci_alt": ("SKY SCI_ALT",), "sci_sh_hght": ("SKY SCI_SH_HGHT",),
+    "sci_moon_sep": ("SKY SCI_MOON_SEP",), "moon_ra": ("SKY MOON_RA",), "moon_dec": ("SKY MOON_DEC",),
+    "moon_phase": ("SKY MOON_PHASE",), "moon_fli": ("SKY MOON_FLI",), "sun_alt": ("SKY SUN_ALT",),
+    "moon_alt": ("SKY MOON_ALT",),
+    **{f"{k}_{s}_sen{c}": (f"{k.upper()}SEN{s[0].upper()}{c.upper()}",)
+       for k in ("std", "sci", "mod") for s in ("mean", "rms") for c in "brz"},
+}
+
+
+def exposures_from_sframes(cfg: PipelineConfig, expnums: Optional[Iterable[int]] = None,
+                           nthreads: int = 16) -> Table:
+    """Exposure table (drpall-like columns) from the SFrame primary headers of all files matching
+    cfg.sframe_pattern (or the standard DRP tree). Only the requested expnums are read."""
+    from concurrent.futures import ThreadPoolExecutor
+    from astropy.io import fits
+    from .paths import default_sframe_pattern, sframe_index, tile_group
+    pattern = cfg.sframe_pattern or default_sframe_pattern(cfg)
+    t0 = time.time()
+    idx = sframe_index(pattern)
+    exps = sorted(idx)
+    if expnums:
+        want = set(int(e) for e in expnums)
+        exps = [e for e in exps if e in want]
+    log.info("SFrames matching %s: %d (%d selected by expnum) in %.1f s", pattern, len(idx), len(exps),
+             time.time() - t0)
+
+    def row(e):
+        try:
+            h = fits.getheader(idx[e], 0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cannot read the header of %s: %s", idx[e], exc)
+            h = {}
+        r = {}
+        for col, keys in HEADER_COLUMNS.items():
+            v = None
+            for k in keys:
+                try:
+                    v = h.get(k)
+                except Exception:  # noqa: BLE001
+                    v = None
+                if v is not None:
+                    break
+            r[col] = v
+        r["expnum"] = int(r["expnum"]) if r["expnum"] is not None else int(e)
+        if int(r["expnum"]) != int(e):
+            log.warning("%s: EXPOSURE %s in the header, %d in the file name (file name used)", idx[e], r["expnum"], e)
+            r["expnum"] = int(e)
+        return r
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, min(int(nthreads), 64))) as ex:
+        rows = list(ex.map(row, exps))
+    cols = {}
+    for c in HEADER_COLUMNS:
+        vals = [r[c] for r in rows]
+        if c in ("expnum", "tileid", "mjd"):
+            cols[c] = np.array([int(v) if v is not None else -1 for v in vals], dtype=np.int64)
+        elif all(v is None or isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                 for v in vals):
+            cols[c] = np.array([np.nan if v is None else float(v) for v in vals])
+        else:
+            cols[c] = np.array(["" if v is None else str(v).strip() for v in vals])
+    t = Table(cols) if rows else Table({c: np.zeros(0, dtype=np.int64 if c in ("expnum", "tileid", "mjd") else float)
+                                        for c in HEADER_COLUMNS})
+    t["tilegrp"] = [tile_group(int(x)) if int(x) >= 0 else "" for x in t["tileid"]] if len(t) else np.zeros(0, "U6")
+    bad = (np.asarray(t["tileid"]) < 0) | (np.asarray(t["mjd"]) < 0) if len(t) else np.zeros(0, bool)
+    if bad.any():
+        log.warning("%d SFrame(s) without TILE_ID / MJD in the header", int(bad.sum()))
+    log.info("exposure table from %d SFrame headers in %.1f s (no drpall)", len(t), time.time() - t0)
+    return t
+
+
+def exposure_table(cfg: PipelineConfig, expnums: Optional[Iterable[int]] = None, nthreads: int = 16) -> Table:
+    """drpall, or (cfg.no_drpall, or no drpall file but an SFrame pattern) the table from the SFrame
+    headers. With an SFrame pattern and a drpall, only exposures with a matching file are kept."""
+    if cfg.no_drpall or (cfg.sframe_pattern and not Path(cfg.drpall_file).exists()):
+        if not cfg.no_drpall:
+            log.warning("drpall %s not found: exposure table from the SFrame headers", cfg.drpall_file)
+        return exposures_from_sframes(cfg, expnums, nthreads)
+    t = load_drpall(cfg)
+    if cfg.sframe_pattern:
+        from .paths import sframe_index
+        have = set(sframe_index(cfg.sframe_pattern))
+        t = t[np.isin(np.asarray(t["expnum"]).astype(int), list(have))]
+    return t
+
+
 def select_exposures(drpall: Table, expnums: Optional[Iterable[int]] = None,
                      mjds: Optional[Iterable[int]] = None,
                      tileids: Optional[Iterable[int]] = None) -> Table:
@@ -306,6 +400,7 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
            write: bool = True, html: bool = True, tag: Optional[str] = None,
            pdf: bool = True, pdf_n: int = 5, pdf_seed: int = 1, xlsx: bool = False,
            html_detail: Optional[bool] = None,
+           sframe_pattern: Optional[str] = None, no_dap: bool = False, no_drpall: bool = False,
            ) -> QAResult:
     """
     Run the QA pipeline.
@@ -319,6 +414,12 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     metric_options           : per-metric parameter overrides.
     metric_modules           : extra modules (dotted name or .py path) defining metrics.
     existing_only            : only keep exposures whose SFrame exists on disk.
+    sframe_pattern           : SFrame files of a non-standard layout, pattern with an {expnum} placeholder
+                               (glob wildcards allowed; zero-padding irrelevant), e.g.
+                               "/data/test/SFrame-*-{expnum}.fits". With a drpall: only matching exposures.
+    no_dap                   : no DAP products: the DAP-based metrics are UNDEFINED.
+    no_drpall                : exposure table from the SFrame primary headers (also automatic when an
+                               sframe_pattern is given and the drpall file does not exist).
     nproc                    : number of worker processes.
     write, html              : write FITS+XLSX (and HTML report) to ``output_dir``.
     tag                      : optional suffix for output file names.
@@ -334,12 +435,13 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
                          output_dir=output_dir, drpall_file=drpall_file,
                          cache_dir=cache_dir, dap_n_models=dap_n_models,
                          dap_target_snr=dap_target_snr,
-                         metric_options=dict(metric_options or {}))
+                         metric_options=dict(metric_options or {}),
+                         sframe_pattern=sframe_pattern, no_dap=bool(no_dap), no_drpall=bool(no_drpall))
     mlist = build_metrics(metrics, cfg.metric_options)
     log.info("lvmqa %s | DRP %s | DAP %s | metrics: %s", __version__, drp_version,
              cfg.dap_label, ", ".join(m.name for m in mlist))
 
-    drpall = load_drpall(cfg)
+    drpall = exposure_table(cfg, expnums, nthreads=max(16, 2 * nproc))
     rows = select_exposures(drpall, expnums, mjds, tileids)
     if existing_only and len(rows):
         t_ex = time.time()
@@ -347,7 +449,9 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
         rows = rows[sframes_exist(cfg, rows, nthreads=max(16, 2 * nproc))]
         log.info("--existing-only: %d of %d SFrames on disk (checked in %.1f s)", len(rows), n0,
                  time.time() - t_ex)
-    log.info("%d exposure(s) selected (drpall: %d rows)", len(rows), len(drpall))
+    from_headers = bool(cfg.no_drpall or (cfg.sframe_pattern and not Path(cfg.drpall_file).exists()))
+    log.info("%d exposure(s) selected (%s: %d rows)", len(rows), "SFrame headers" if from_headers else "drpall",
+             len(drpall))
 
     for m in mlist:
         m.prepare(cfg)
@@ -372,7 +476,9 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     finalize_records(records, mlist, cfg, drpall)
     table = build_table(rows, records, mlist, cfg)
     selection = {"expnums": list(expnums or []), "mjds": list(mjds or []),
-                 "tileids": list(tileids or []), "existing_only": existing_only}   # report: shown as ranges
+                 "tileids": list(tileids or []), "existing_only": existing_only,   # report: shown as ranges
+                 "sframe_pattern": cfg.sframe_pattern or "", "no_dap": cfg.no_dap,
+                 "no_drpall": from_headers}
     result = QAResult(table=table, metrics=mlist, config=cfg, selection=selection,
                       nproc=nproc)
     table.meta["RUNTIME"] = round(time.time() - t_start, 1)
@@ -398,7 +504,8 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
                     metric_options=cfg.metric_options, redux_dir=cfg.redux_dir,
                     analysis_dir=cfg.analysis_dir, output_dir=cfg.output_dir,
                     drpall_file=cfg.drpall_file, cache_dir=cfg.cache_dir,
-                    dap_n_models=cfg.dap_n_models, dap_target_snr=cfg.dap_target_snr)
+                    dap_n_models=cfg.dap_n_models, dap_target_snr=cfg.dap_target_snr,
+                    sframe_pattern=cfg.sframe_pattern, no_dap=cfg.no_dap, no_drpall=selection["no_drpall"])
                 log.info("diagnostics PDF in %.1f s", time.time() - t_pdf)
             except Exception as exc:  # noqa: BLE001 - the tables are already written
                 log.error("diagnostics PDF failed: %s", exc, exc_info=log.isEnabledFor(logging.DEBUG))
