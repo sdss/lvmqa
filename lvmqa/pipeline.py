@@ -25,7 +25,7 @@ log = logging.getLogger("lvmqa")
 
 # drpall columns copied to the output: identification (main + supl files) and
 # observational context (supl file only)
-MAIN_ID_COLUMNS = ("expnum", "tileid", "mjd", "object")
+MAIN_ID_COLUMNS = ("expnum", "tileid", "mjd", "object", "group")   # group: exposure file (v1.16), default "all"
 ID_COLUMNS = MAIN_ID_COLUMNS + ("exptime", "obstime", "dpos", "sci_ra", "sci_dec", "sci_pa",
                                 "sci_amass", "fluxcal")
 IO_KEYS = ("io_sframe", "io_dap", "io_dap_output")
@@ -75,22 +75,38 @@ HEADER_COLUMNS = {
 }
 
 
+MAX_HEADER_FILES = 500   # without --force, at most this many SFrame headers are read (no drpall)
+
+
+class TooManyFilesError(RuntimeError):
+    """Raised before reading more SFrame headers than allowed (exposure table without drpall)."""
+
+
 def exposures_from_sframes(cfg: PipelineConfig, expnums: Optional[Iterable[int]] = None,
-                           nthreads: int = 16) -> Table:
+                           nthreads: int = 16, max_files: Optional[int] = None) -> Table:
     """Exposure table (drpall-like columns) from the SFrame primary headers of all files matching
-    cfg.sframe_pattern (or the standard DRP tree). Only the requested expnums are read."""
+    cfg.sframe_pattern (or the standard DRP tree). Only the requested expnums are read.
+    max_files: refuse (RuntimeError) if more headers would be read (None / 0: no limit)."""
     from concurrent.futures import ThreadPoolExecutor
     from astropy.io import fits
     from .paths import default_sframe_pattern, sframe_index, tile_group
     pattern = cfg.sframe_pattern or default_sframe_pattern(cfg)
+    if not cfg.sframe_pattern:
+        log.warning("no drpall and no SFrame pattern: listing the whole standard DRP tree %s (can be slow)",
+                    pattern)
     t0 = time.time()
     idx = sframe_index(pattern)
     exps = sorted(idx)
     if expnums:
         want = set(int(e) for e in expnums)
         exps = [e for e in exps if e in want]
-    log.info("SFrames matching %s: %d (%d selected by expnum) in %.1f s", pattern, len(idx), len(exps),
-             time.time() - t0)
+    log.info("SFrames matching %s: %d (%d selected by expnum) in %.1f s; %d header(s) to read", pattern,
+             len(idx), len(exps), time.time() - t0, len(exps))
+    if max_files and len(exps) > max_files:
+        raise TooManyFilesError(
+            f"no drpall: {len(exps)} SFrame headers would be read from {pattern} (limit {max_files}). "
+            "Check the SFrame pattern / quoting, narrow the selection (--expnums, --exposure-file), "
+            "or use --force (or --max-header-files N) to proceed.")
 
     def row(e):
         try:
@@ -138,13 +154,14 @@ def exposures_from_sframes(cfg: PipelineConfig, expnums: Optional[Iterable[int]]
     return t
 
 
-def exposure_table(cfg: PipelineConfig, expnums: Optional[Iterable[int]] = None, nthreads: int = 16) -> Table:
+def exposure_table(cfg: PipelineConfig, expnums: Optional[Iterable[int]] = None, nthreads: int = 16,
+                   max_files: Optional[int] = None) -> Table:
     """drpall, or (cfg.no_drpall, or no drpall file but an SFrame pattern) the table from the SFrame
     headers. With an SFrame pattern and a drpall, only exposures with a matching file are kept."""
     if cfg.no_drpall or (cfg.sframe_pattern and not Path(cfg.drpall_file).exists()):
         if not cfg.no_drpall:
             log.warning("drpall %s not found: exposure table from the SFrame headers", cfg.drpall_file)
-        return exposures_from_sframes(cfg, expnums, nthreads)
+        return exposures_from_sframes(cfg, expnums, nthreads, max_files=max_files)
     t = load_drpall(cfg)
     if cfg.sframe_pattern:
         from .paths import sframe_index
@@ -169,6 +186,23 @@ def select_exposures(drpall: Table, expnums: Optional[Iterable[int]] = None,
             log.warning("expnum(s) not in drpall (or excluded by other filters): %s",
                         missing[:20] if len(missing) > 20 else missing)
     return out
+
+
+def assign_groups(rows: Table, spec=None) -> None:
+    """Column ``group`` from an exposure file spec {expnum: (mjd, group)}; "all" otherwise."""
+    from .expfile import DEFAULT_GROUP, check_mjds
+    if spec:
+        check_mjds(spec, rows)
+    g = [spec.get(int(e), (0, DEFAULT_GROUP))[1] if spec else DEFAULT_GROUP for e in rows["expnum"]]
+    rows["group"] = np.asarray(g, dtype=f"U{max([len(x) for x in g] + [3])}")
+    rows["group"].description = "Exposure group (exposure file; default all)"
+
+
+def group_counts_text(rows: Table) -> str:
+    from collections import Counter
+    if "group" not in rows.colnames:
+        return ""
+    return ", ".join(f"{g}: {n}" for g, n in sorted(Counter(str(x) for x in rows["group"]).items()))
 
 
 def sframes_exist(cfg: PipelineConfig, rows: Table, nthreads: int = 16) -> np.ndarray:
@@ -401,6 +435,7 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
            pdf: bool = True, pdf_n: int = 5, pdf_seed: int = 1, xlsx: bool = False,
            html_detail: Optional[bool] = None,
            sframe_pattern: Optional[str] = None, no_dap: bool = False, no_drpall: bool = False,
+           exposure_file=None, max_header_files: Optional[int] = MAX_HEADER_FILES,
            ) -> QAResult:
     """
     Run the QA pipeline.
@@ -420,6 +455,11 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     no_dap                   : no DAP products: the DAP-based metrics are UNDEFINED.
     no_drpall                : exposure table from the SFrame primary headers (also automatic when an
                                sframe_pattern is given and the drpall file does not exist).
+    exposure_file            : TOML file MJD -> group (optional) -> expnums (see lvmqa.expfile); selects
+                               these exposures (AND with the other filters) and fills the column
+                               ``group`` (default "all").
+    max_header_files         : without a drpall, refuse to read more SFrame headers than this (safety
+                               against listing a whole production tree by mistake; None / 0 = no limit).
     nproc                    : number of worker processes.
     write, html              : write FITS+XLSX (and HTML report) to ``output_dir``.
     tag                      : optional suffix for output file names.
@@ -441,8 +481,17 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
     log.info("lvmqa %s | DRP %s | DAP %s | metrics: %s", __version__, drp_version,
              cfg.dap_label, ", ".join(m.name for m in mlist))
 
-    drpall = exposure_table(cfg, expnums, nthreads=max(16, 2 * nproc))
+    groups_spec = None
+    if exposure_file:
+        from .expfile import read_exposure_file
+        groups_spec = read_exposure_file(exposure_file)
+        fexp = sorted(groups_spec)
+        expnums = [e for e in fexp if e in set(int(x) for x in expnums)] if expnums else fexp
+        log.info("exposure file %s: %d exposure(s) in %d group(s)", exposure_file, len(fexp),
+                 len({g for _, g in groups_spec.values()}))
+    drpall = exposure_table(cfg, expnums, nthreads=max(16, 2 * nproc), max_files=max_header_files)
     rows = select_exposures(drpall, expnums, mjds, tileids)
+    assign_groups(rows, groups_spec)
     if existing_only and len(rows):
         t_ex = time.time()
         n0 = len(rows)
@@ -475,7 +524,9 @@ def run_qa(drp_version: str, dap_version: Optional[str] = None,
 
     finalize_records(records, mlist, cfg, drpall)
     table = build_table(rows, records, mlist, cfg)
-    selection = {"expnums": list(expnums or []), "mjds": list(mjds or []),
+    selection = {**({"exposure_file": str(exposure_file), "groups": group_counts_text(rows)}
+                    if exposure_file else {}),
+                 "expnums": list(expnums or []), "mjds": list(mjds or []),
                  "tileids": list(tileids or []), "existing_only": existing_only,   # report: shown as ranges
                  "sframe_pattern": cfg.sframe_pattern or "", "no_dap": cfg.no_dap,
                  "no_drpall": from_headers}

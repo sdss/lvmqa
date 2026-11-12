@@ -91,8 +91,9 @@ def _fmt(v) -> str:
 def _hover_base(result) -> np.ndarray:
     t = result.table
     obj = t["object"] if "object" in t.colnames else [""] * len(t)
-    return np.asarray([f"<b>{int(e)}</b> tile {int(ti)} MJD {int(mj)}<br>{_html.escape(str(o))}"
-                       for e, ti, mj, o in zip(t["expnum"], t["tileid"], t["mjd"], obj)], dtype=object)
+    grp = [f" [{_html.escape(str(g))}]" for g in t["group"]] if groups_of(t) else [""] * len(t)
+    return np.asarray([f"<b>{int(e)}</b> tile {int(ti)} MJD {int(mj)}{g}<br>{_html.escape(str(o))}"
+                       for e, ti, mj, o, g in zip(t["expnum"], t["tileid"], t["mjd"], obj, grp)], dtype=object)
 
 
 def _hover_metric(result, m, notes) -> np.ndarray:
@@ -117,19 +118,50 @@ def _hover_for_column(result, col, base, per_metric) -> np.ndarray:
     return base + np.asarray([f"<br>{col}: <b>{v}</b>" for v in t[col]], dtype=object)
 
 
+def groups_of(t) -> List[str]:
+    """Exposure groups of the run (exposure file, v1.16): [] if there is at most one."""
+    if "group" not in t.colnames or not len(t):
+        return []
+    g = sorted({str(x) for x in t["group"]}, key=lambda x: (x != "all", x.lower()))
+    return g if len(g) > 1 else []
+
+
 def fig_counts(result):
+    """Stacked status counts per metric; with several exposure groups a selector (default 'all' =
+    every exposure; the group 'all' itself = exposures without a group are part of it)."""
     import plotly.graph_objects as go
     t = result.table
     cols = _flag_columns(result)[::-1]
+    groups = groups_of(t)
+    gcol = np.asarray(t["group"]).astype(str) if groups else None
+    sets = [("all", np.ones(len(t), bool))] + [(g, gcol == g) for g in groups if g != "all"]
+    if groups and "all" in groups:
+        sets.append(("all (no group)", gcol == "all"))
     fig = go.Figure()
-    for s in STATUS:
-        counts = [int(np.sum(np.asarray(t[c]) == s)) for c, _ in cols]
-        fig.add_bar(y=[lab for _, lab in cols], x=counts, name=f"{ICON[s]} {s}", orientation="h",
-                    marker=dict(color=COLORS[s], line=dict(color=SURFACE, width=2)),
-                    hovertemplate="%{y}<br>" + s + ": %{x}<extra></extra>")
+    for k, (g, m) in enumerate(sets):
+        for s in STATUS:
+            counts = [int(np.sum(np.asarray(t[c])[m] == s)) for c, _ in cols]
+            fig.add_bar(y=[lab for _, lab in cols], x=counts, name=f"{ICON[s]} {s}", orientation="h",
+                        marker=dict(color=COLORS[s], line=dict(color=SURFACE, width=2)), visible=k == 0,
+                        hovertemplate="%{y}<br>" + s + ": %{x}" + (f" ({_html.escape(g)})" if groups else "")
+                        + "<extra></extra>")
     fig.update_layout(barmode="stack", legend_traceorder="normal")
-    return _layout(fig, "Status counts per metric", height=120 + 34 * len(cols),
-                   xaxis_title="number of exposures")
+    title = "Status counts per metric"
+    if groups:
+        ns = len(STATUS)
+        buttons = [dict(label=f"{g} ({int(m.sum())})", method="update",
+                        args=[{"visible": [j // ns == k for j in range(ns * len(sets))]},
+                              {"title.text": f"{title}: group {_html.escape(g)} ({int(m.sum())} exposures)"}])
+                   for k, (g, m) in enumerate(sets)]
+        fig.update_layout(updatemenus=[dict(type="dropdown", buttons=buttons, active=0, x=0, xanchor="left",
+                                            y=1.0, yanchor="bottom", pad=dict(t=0, b=6),
+                                            bgcolor="white", bordercolor=GRID, font=dict(size=12))])
+        title = f"{title}: group all ({len(t)} exposures)"
+    fig = _layout(fig, title, height=120 + 34 * len(cols) + (40 if groups else 0),
+                  xaxis_title="number of exposures")
+    if groups:
+        fig.update_layout(title=dict(y=0.995, yanchor="top", x=0.25), margin=dict(t=80))
+    return fig
 
 
 def fig_heatmap(result, base, per_metric, which="all"):
@@ -616,7 +648,7 @@ def _ranges(vals) -> str:
 def selection_text(sel) -> str:
     parts = []
     for k, v in (sel or {}).items():
-        if v is None or v is False or (hasattr(v, "__len__") and not isinstance(v, str) and len(v) == 0):
+        if v is None or v is False or v == "" or (hasattr(v, "__len__") and not isinstance(v, str) and len(v) == 0):
             continue
         if isinstance(v, (list, tuple, np.ndarray)) and len(v) and all(isinstance(x, (int, np.integer)) for x in v):
             parts.append(f"{k}: {_ranges(v)}")
@@ -956,7 +988,8 @@ def lookup_html(result) -> str:
     data = dict(e=[int(x) for x in t["expnum"]], t=[int(x) for x in t["tileid"]], m=[int(x) for x in t["mjd"]],
                 b=[format(int(x) & ((1 << 64) - 1), "x") for x in t["qa_bitmask"]],
                 o="".join(str(int(c)) for c in _codes(t["qa_overall"])) if "qa_overall" in t.colnames else "",
-                s=slots, L=STATUS, C=[COLORS[s] for s in STATUS])
+                s=slots, L=STATUS, C=[COLORS[s] for s in STATUS],
+                g=[str(x) for x in t["group"]] if groups_of(t) else [])
     js = """
 <div class="card" style="padding:12px">
 <label>expnum: <input id="lk-in" type="number" style="width:140px" placeholder="e.g. 12345"></label>
@@ -967,7 +1000,7 @@ const pill=(c)=>'<span class="pill" style="--c:'+D.C[c]+'">'+D.L[c]+'</span>';
 function show(){const v=parseInt(document.getElementById('lk-in').value);const i=ix.get(v);
 const out=document.getElementById('lk-out'),msg=document.getElementById('lk-msg');
 if(i===undefined){out.innerHTML='';msg.textContent=isNaN(v)?'':' not in this run';return;}
-const bm=BigInt('0x'+D.b[i]);msg.textContent=' tile '+D.t[i]+', MJD '+D.m[i]+', qa_bitmask '+bm.toString();
+const bm=BigInt('0x'+D.b[i]);msg.textContent=' tile '+D.t[i]+', MJD '+D.m[i]+(D.g.length?', group '+D.g[i]:'')+', qa_bitmask '+bm.toString();
 let h='<table><thead><tr><th>metric</th><th>status</th></tr></thead><tbody>';
 if(D.o)h+='<tr><td><b>qa_overall</b></td><td>'+pill(+D.o[i])+'</td></tr>';
 for(const [n,s] of D.s){const c=Number((bm>>BigInt(2*s))&3n);h+='<tr><td>'+n+'</td><td>'+pill(c)+'</td></tr>';}
@@ -1100,7 +1133,8 @@ def write_html(result, path, detail=None) -> Path:
     flagged_html = ""
     if detail:
         flagged = [r for r in t if str(r["qa_overall"]) != "GOOD"]
-        fcols = ["expnum", "tileid", "mjd", "object", "qa_overall"] + [m.name for m in result.metrics] + ["qa_notes"]
+        fcols = (["expnum", "tileid", "mjd", "object"] + (["group"] if groups_of(t) else []) + ["qa_overall"]
+                 + [m.name for m in result.metrics] + ["qa_notes"])
         frows = [{c: (str(r[c]) if str(r[c]) != "--" else "") for c in fcols if c in t.colnames}
                  for r in flagged[:1000]]
         flagged_html = (f"<h2>Exposures not GOOD ({len(flagged)})</h2>"

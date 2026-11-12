@@ -108,7 +108,7 @@ _ID_DESC = {
     "object": "Target name", "exptime": "Exposure time", "obstime": "Start of the observation (UTC)",
     "dpos": "Dither position", "sci_ra": "Science IFU center RA", "sci_dec": "Science IFU center Dec",
     "sci_pa": "Science IFU position angle", "sci_amass": "Science airmass",
-    "fluxcal": "Flux calibration method",
+    "fluxcal": "Flux calibration method", "group": "Exposure group (exposure file; default all)",
 }
 
 
@@ -162,6 +162,9 @@ def _primary(result, kind: str) -> fits.PrimaryHDU:
     for key, name in (("expnums", "SELEXP"), ("mjds", "SELMJD"), ("tileids", "SELTILE")):
         h[name] = (to_ascii(",".join(map(str, sel.get(key, []))) or "all")[:68], f"{key} selection")
     h["RUNTIME"] = (result.table.meta.get("RUNTIME", -1), "[s] pipeline run time")
+    if sel.get("exposure_file"):    # v1.16
+        h["EXPFILE"] = (to_ascii(Path(str(sel["exposure_file"])).name)[:68], "exposure selection file (TOML)")
+        h["GROUPS"] = (to_ascii(str(sel.get("groups", "")))[:68], "exposure groups: counts")
     # non-standard inputs (v1.15): needed again by the diagnostics PDF of a recalculation
     if sel.get("sframe_pattern"):
         h["SFPATT"] = (to_ascii(str(sel["sframe_pattern"])), "SFrame file pattern ({expnum} placeholder)")

@@ -46,6 +46,17 @@ def parse_metric_options(items: Optional[Sequence[str]]) -> Dict[str, Dict]:
     return opts
 
 
+def check_version_arg(parser, name: str, value: Optional[str]) -> None:
+    """Positional version arguments must not look like options (e.g. a misplaced quote turned
+    "--sframe-pattern '/path'" into one argument that became the DAP version)."""
+    if value is None:
+        return
+    v = str(value)
+    if v.startswith("-") or any(ch.isspace() for ch in v):
+        parser.error(f"{name} {v!r} looks like an option or contains spaces: check the quoting of the "
+                     f"command line (e.g. --sframe-pattern 'PATTERN' needs a space before the quote)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="lvmqa",
@@ -59,6 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     sel.add_argument("--expnums", nargs="+", metavar="N", help="exposure numbers (lists/ranges: 1,2 5-9)")
     sel.add_argument("--mjds", nargs="+", metavar="N", help="MJDs (lists/ranges allowed)")
     sel.add_argument("--tileids", nargs="+", metavar="N", help="tile ids (lists/ranges allowed)")
+    sel.add_argument("--exposure-file", metavar="TOML",
+                     help="TOML file MJD -> group (optional) -> expnums: run these exposures; the group "
+                          "(default 'all') is stored in the column 'group' and selectable in the HTML report")
     sel.add_argument("--existing-only", action="store_true",
                      help="skip exposures whose SFrame is not on disk")
     mg = ap.add_argument_group("metrics")
@@ -96,6 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     og.add_argument("--pdf-n", type=int, default=5, metavar="N",
                     help="diagnostics PDF: random exposures per status and metric (default 5)")
     og.add_argument("--pdf-seed", type=int, default=1, help="diagnostics PDF: random seed (default 1)")
+    og.add_argument("--max-header-files", type=int, default=None, metavar="N",
+                    help="without a drpall: refuse to read more than N SFrame headers (default 500)")
+    og.add_argument("--force", action="store_true",
+                    help="no limit on the number of SFrame headers read without a drpall")
     og.add_argument("--no-write", action="store_true", help="do not write any output")
     og.add_argument("-j", "--nproc", type=int, default=1, help="worker processes (default 1)")
     og.add_argument("-v", "--verbose", action="count", default=0)
@@ -109,6 +127,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if not args.list_metrics and not args.drp_version:
         parser.error("drp_version is required")
+    check_version_arg(parser, "drp_version", args.drp_version)
+    check_version_arg(parser, "dap_version", args.dap_version)
     level = logging.WARNING if args.quiet else (logging.DEBUG if args.verbose > 1 else logging.INFO)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)-7s %(message)s",
                         datefmt="%H:%M:%S")
@@ -124,8 +144,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"{'':10s}{k} = {v!r}")
         return 0
 
-    from .pipeline import run_qa
-    res = run_qa(
+    from .pipeline import MAX_HEADER_FILES, TooManyFilesError, run_qa
+    try:
+        res = _run(args, run_qa, MAX_HEADER_FILES)
+    except TooManyFilesError as exc:
+        parser.exit(2, f"lvmqa: error: {exc}\n")
+    _summary(res)
+    return 0
+
+
+def _run(args, run_qa, max_header_files):
+    return run_qa(
         args.drp_version, args.dap_version,
         expnums=parse_int_list(args.expnums), mjds=parse_int_list(args.mjds),
         tileids=parse_int_list(args.tileids),
@@ -139,7 +168,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pdf=not args.no_pdf, pdf_n=args.pdf_n, pdf_seed=args.pdf_seed, xlsx=args.xlsx,
         html_detail=True if args.html_detail else None,
         sframe_pattern=args.sframe_pattern, no_dap=args.no_dap, no_drpall=args.no_drpall,
+        exposure_file=args.exposure_file,
+        max_header_files=None if args.force else (args.max_header_files or max_header_files),
     )
+
+
+def _summary(res) -> None:
     t = res.table
     if len(t):
         from collections import Counter
@@ -152,7 +186,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"  {m.name:18s} {dict(Counter(str(x) for x in t[m.name]))}")
     for k, p in res.files.items():
         print(f"  {k:12s} {p}")
-    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

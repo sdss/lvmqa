@@ -3,8 +3,10 @@ Diagnostics of an existing QA run.
 
 1) Diagnostic PDF (make_pdf): for every metric that analyses spectra, up to ``n`` random exposures
    per status (MAJOR ISSUE, WARNING, GOOD) with their SFrame / DAP / DAP-output data and models in
-   the relevant wavelength range (one page per metric); last page: Halpha maps of the tiles (DAP
-   NP fluxes) with the qa_fluxmap results. Written automatically at the end of every pipeline run
+   the relevant wavelength range (one page per metric), each followed by the distributions of the
+   metric's per-exposure values with the adopted limits and statistics (v1.15, lvmqa.histpages;
+   histogram pages of the metrics without example spectra follow); then the qa_fluxmap and
+   qa_gradient map pages and their histograms. Written automatically at the end of every pipeline run
    (``python -m lvmqa ...``; --no-pdf to skip).
 
 2) CLI = re-derivation of the flags from the stored measurements (no metric is recomputed):
@@ -1346,6 +1348,35 @@ def _fiber_image(x, y, v, xlim, ylim, npix=900):
     return img.reshape(ny, nx)
 
 
+def _hist_order(qa):
+    """Metrics with histogram specs, in registry order, present in the QA table."""
+    from .histpages import SPECS
+    from .registry import available_metrics
+    return [m for m in available_metrics() if m in SPECS and m in qa.colnames]
+
+
+def _hist(pdf, metric, cfg, qa, supl) -> int:
+    """Histogram page(s) of the per-exposure values of ``metric`` (lvmqa.histpages)."""
+    from .histpages import hist_pages
+    try:
+        m = _minst(metric, cfg)
+        return hist_pages(pdf, metric, m.params, qa, supl, m.short, criteria_text=_criteria_text(metric, cfg))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("diagnostics PDF: histograms of %s failed: %s", metric, exc)
+        return 0
+
+
+def hist_pdf(qa, supl, cfg, out) -> Path:
+    """PDF with only the value-distribution pages of all metrics (no data are read)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.backends.backend_pdf import PdfPages
+    with PdfPages(out) as pdf:
+        for m in _hist_order(qa):
+            _hist(pdf, m, cfg, qa, supl)
+    return Path(out)
+
+
 def _criteria_text(metric, cfg, width=190) -> str:
     """Short summary of the GOOD / WARNING / MAJOR definitions of a metric (current parameters)."""
     import textwrap
@@ -1476,7 +1507,12 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
             fig.tight_layout(rect=(0.05, 0.12, 1, 0.96))
             pdf.savefig(fig)
             plt.close(fig)
+            _hist(pdf, metric, cfg, qa, supl)            # value distributions with the limits (v1.15)
         log.info("diagnostics PDF: %d metric pages drawn in %.1f s", len(picked), time.time() - t0)
+        t0 = time.time()
+        late = ("qa_fluxmap", "qa_gradient")
+        nh = sum(_hist(pdf, m, cfg, qa, supl) for m in _hist_order(qa) if m not in picked and m not in late)
+        log.info("diagnostics PDF: %d histogram pages of the other metrics in %.1f s", nh, time.time() - t0)
         t0 = time.time()
         coords = {e: (float(r.get("sci_ra", np.nan)), float(r.get("sci_dec", np.nan))) for e, r in rows.items()}
         try:
@@ -1484,10 +1520,12 @@ def make_pdf(drp_version, dap_version=None, n=5, seed=1, nproc=3, out=None, tag=
         except Exception as exc:  # noqa: BLE001
             log.warning("diagnostics PDF: fluxmap overview failed: %s", exc)
         _fluxmap_page(pdf, qa, supl, cfg, coords=coords, nproc=nproc)
+        _hist(pdf, "qa_fluxmap", cfg, qa, supl)
         try:
             _gradient_page(pdf, qa, supl, cfg, seed=seed)
         except Exception as exc:  # noqa: BLE001
             log.warning("diagnostics PDF: qa_gradient page failed: %s", exc)
+        _hist(pdf, "qa_gradient", cfg, qa, supl)
         log.info("diagnostics PDF: fluxmap page in %.1f s", time.time() - t0)
     return out
 

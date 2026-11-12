@@ -644,7 +644,7 @@ def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Opt
                 metric_options: Optional[Dict[str, Dict[str, Any]]] = None, output_dir=None,
                 write: bool = True, html: bool = True, pdf: bool = False, suffix: str = "_recalculated",
                 check: bool = False, pdf_n: int = 5, pdf_seed: int = 1, nproc: int = 3, xlsx: bool = False,
-                html_detail: Optional[bool] = None, **paths):
+                html_detail: Optional[bool] = None, hist_pdf: bool = False, exposure_file=None, **paths):
     """Re-derive all flags from the stored measurements (no SFrame / DAP access); returns
     (QAResult, changes table). Writes <base><suffix>.*; the diagnostics PDF (re-reads the data of
     the plotted exposures) only if ``pdf``."""
@@ -705,12 +705,23 @@ def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Opt
                 if o != n:
                     changes.append((rec["expnum"], m.name, o, n))
     rows = supl[[c for c in ID_COLUMNS if c in supl.colnames]]
+    from .pipeline import assign_groups, group_counts_text
+    if exposure_file:     # (re)assign the groups; exposures not in the file -> "all" (v1.16)
+        from .expfile import read_exposure_file
+        spec = read_exposure_file(exposure_file)
+        nin = sum(int(e) in spec for e in rows["expnum"])
+        log.info("exposure file %s: groups of %d of %d exposures (others: all)", exposure_file, nin, len(rows))
+        assign_groups(rows, spec)
+    elif "group" not in rows.colnames:
+        assign_groups(rows, None)
     table = build_table(rows, recs, mlist, cfg)
     table.meta.update({k: v for k, v in qa.meta.items() if k in ("RUNTIME",)})
     from .diagnostics import _inputs_from_header
     _inputs_from_header(cfg, base)   # carry the non-standard inputs (SFrame pattern etc.) over
     result = QAResult(table=table, metrics=mlist, config=cfg,
                       selection={"recalculated_from": f"{base.name}.fits",
+                                 **({"exposure_file": str(exposure_file), "groups": group_counts_text(rows)}
+                                    if exposure_file else {}),
                                  "overrides": str(metric_options or {}),
                                  "sframe_pattern": cfg.sframe_pattern or "", "no_dap": cfg.no_dap,
                                  "no_drpall": cfg.no_drpall})
@@ -727,6 +738,11 @@ def recalculate(drp_version: str, dap_version: Optional[str] = None, *, tag: Opt
             result.files["html"] = write_html(result, Path(f"{out}.html"), detail=html_detail)
         ch.write(f"{out}_changes.csv", overwrite=True)
         result.files["changes"] = Path(f"{out}_changes.csv")
+        if hist_pdf:     # value distributions only (no data access; v1.15)
+            from .diagnostics import hist_pdf as _hist_pdf
+            result.files["hist_pdf"] = _hist_pdf(Table.read(f"{out}.fits", hdu="QA"),
+                                                 Table.read(f"{out}_supl.fits", hdu="SUPL"), cfg,
+                                                 Path(f"{out}_diagnostics_hist.pdf"))
         if pdf:
             from .diagnostics import make_pdf
             result.files["pdf"] = make_pdf(drp_version, dap_version, n=pdf_n, seed=pdf_seed, nproc=nproc,
@@ -750,6 +766,10 @@ def main(argv=None, prog=None):
     ap.add_argument("--xlsx", action="store_true", help="also write the XLSX copies of the tables")
     ap.add_argument("--pdf", action="store_true",
                     help="also regenerate the diagnostics PDF for the recalculated flags (re-reads the data)")
+    ap.add_argument("--exposure-file", metavar="TOML", default=None,
+                    help="(re)assign the exposure groups from this TOML file (others: 'all')")
+    ap.add_argument("--hist-pdf", action="store_true",
+                    help="PDF with only the metric value distributions and limits (no data access)")
     ap.add_argument("--n", type=int, default=5, help="PDF: random exposures per status and metric")
     ap.add_argument("--seed", type=int, default=1, help="PDF: random seed")
     ap.add_argument("-j", "--nproc", type=int, default=3, help="PDF: worker processes")
@@ -760,6 +780,9 @@ def main(argv=None, prog=None):
         ap.add_argument(f"--{k.replace('_', '-')}", dest=k, default=None)
     ap.add_argument("--drpall", dest="drpall_file", default=None, help="alias of --drpall-file")
     a = ap.parse_args(argv)
+    from .cli import check_version_arg
+    check_version_arg(ap, "drp_version", a.drp_version)
+    check_version_arg(ap, "dap_version", a.dap_version)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     if a.list_params:
         for k, v in FLAG_PARAMS.items():
@@ -780,7 +803,7 @@ def main(argv=None, prog=None):
     paths = {k: getattr(a, k) for k in ("redux_dir", "analysis_dir", "drpall_file", "cache_dir") if getattr(a, k)}
     res, ch = recalculate(a.drp_version, a.dap_version, tag=a.tag, metric_options=opts, output_dir=a.output_dir,
                           html=not a.no_html, pdf=a.pdf, suffix=a.suffix, check=a.check,
-                          html_detail=True if a.html_detail else None,
+                          html_detail=True if a.html_detail else None, hist_pdf=a.hist_pdf, exposure_file=a.exposure_file,
                           pdf_n=a.n, pdf_seed=a.seed, nproc=a.nproc, xlsx=a.xlsx, **paths)
     from collections import Counter
     print(f"{len(ch)} flag change(s): " + ", ".join(f"{k}: {n}" for k, n in Counter(ch["metric"]).most_common()))
